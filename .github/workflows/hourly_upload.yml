@@ -11,7 +11,7 @@ jobs:
 
     env:
       RENDER_API_BASE: https://comoflo.onrender.com/api
-      GITHUB_REPO: yourusername/yourrepo
+      GITHUB_REPO: Vishtheendodoc/ComOflo
       DATA_FOLDER: data_snapshots
 
     steps:
