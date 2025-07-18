@@ -1,0 +1,92 @@
+name: Hourly Orderflow Upload
+
+on:
+  schedule:
+    - cron: '30 * * * *'  # Every hour at minute 0 ITS
+  workflow_dispatch:      # Allow manual run from Actions tab
+
+jobs:
+  upload-orderflow:
+    runs-on: ubuntu-latest
+
+    env:
+      RENDER_API_BASE: https://comoflo.onrender.com/api
+      GITHUB_REPO: yourusername/yourrepo
+      DATA_FOLDER: data_snapshots
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Install dependencies
+      run: |
+        pip install requests pandas PyGithub
+
+    - name: Fetch and upload data
+      run: |
+        python - <<EOF
+        import requests, pandas as pd
+        from datetime import datetime
+        from github import Github
+        import os
+
+        # Config
+        api_base = "${{ env.RENDER_API_BASE }}"
+        api_stocks = f"{api_base}/stocks"
+        api_data = f"{api_base}/delta_data/"
+        repo_name = "${{ env.GITHUB_REPO }}"
+        token = os.environ["GITHUB_TOKEN"]
+        now = datetime.utcnow()
+        filename = f"orderflow_{now.strftime('%Y%m%d_%H')}.csv"
+        remote_path = f"{os.environ['DATA_FOLDER']}/{filename}"
+
+        # --- Fetch security IDs dynamically ---
+        print("📡 Fetching stock list from /api/stocks...")
+        try:
+            resp = requests.get(api_stocks, timeout=15)
+            resp.raise_for_status()
+            stock_list = resp.json()
+            security_ids = [str(s['security_id']) for s in stock_list if 'security_id' in s]
+            print(f"✅ Found {len(security_ids)} securities")
+        except Exception as e:
+            print(f"❌ Failed to fetch stock list: {e}")
+            exit(1)
+
+        # --- Fetch data for each security ---
+        combined_df = pd.DataFrame()
+        for sid in security_ids:
+            try:
+                print(f"📥 Fetching data for {sid}")
+                resp = requests.get(f"{api_data}{sid}?interval=1", timeout=15)
+                resp.raise_for_status()
+                data = resp.json()
+                if data:
+                    df = pd.DataFrame(data)
+                    df['security_id'] = sid
+                    combined_df = pd.concat([combined_df, df], ignore_index=True)
+            except Exception as e:
+                print(f"⚠️ Error fetching {sid}: {e}")
+
+        if combined_df.empty:
+            print("⚠️ No data fetched for any security. Skipping upload.")
+            exit(0)
+
+        combined_df.to_csv(filename, index=False)
+        print(f"✅ Saved snapshot: {filename}")
+
+        # --- Upload to GitHub ---
+        g = Github(token)
+        repo = g.get_repo(repo_name)
+        try:
+            contents = repo.get_contents(remote_path)
+            repo.update_file(contents.path, f"Update {remote_path}", open(filename, "rb").read(), contents.sha)
+            print(f"✅ Updated {remote_path}")
+        except:
+            repo.create_file(remote_path, f"Create {remote_path}", open(filename, "rb").read())
+            print(f"✅ Created {remote_path}")
+        EOF
