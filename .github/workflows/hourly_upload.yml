@@ -2,16 +2,16 @@ name: Hourly Orderflow Upload
 
 on:
   schedule:
-    - cron: '30 * * * *'  # Every hour at minute 0 ITS
-  workflow_dispatch:      # Allow manual run from Actions tab
+    - cron: '30 * * * *'  # 🔥 Every hour IST (00:00, 01:00...) because 30 UTC = 00:00 IST
+  workflow_dispatch:       # 🔥 Allow manual trigger from Actions tab
 
 jobs:
   upload-orderflow:
     runs-on: ubuntu-latest
 
     env:
-      RENDER_API_BASE: https://comoflo.onrender.com/api
-      GITHUB_REPO: Vishtheendodoc/ComOflo
+      RENDER_API_BASE: https://comoflo.onrender.com/api  # 🔥 Replace with your Flask API base URL
+      GITHUB_REPO: vishtheendodoc/comoflo                  # 🔥 Replace with your GitHub username/repo
       DATA_FOLDER: data_snapshots
 
     steps:
@@ -35,7 +35,7 @@ jobs:
         from github import Github
         import os
 
-        # Config
+        # --- Config ---
         api_base = "${{ env.RENDER_API_BASE }}"
         api_stocks = f"{api_base}/stocks"
         api_data = f"{api_base}/delta_data/"
@@ -45,8 +45,8 @@ jobs:
         filename = f"orderflow_{now.strftime('%Y%m%d_%H')}.csv"
         remote_path = f"{os.environ['DATA_FOLDER']}/{filename}"
 
-        # --- Fetch security IDs dynamically ---
-        print("📡 Fetching stock list from /api/stocks...")
+        # --- Fetch security IDs from /api/stocks ---
+        print("📡 Fetching stock list...")
         try:
             resp = requests.get(api_stocks, timeout=15)
             resp.raise_for_status()
