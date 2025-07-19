@@ -2,16 +2,16 @@ name: Hourly Orderflow Upload
 
 on:
   schedule:
-    - cron: '30 * * * *'  # 🔥 Every hour IST (00:00, 01:00...) because 30 UTC = 00:00 IST
-  workflow_dispatch:       # 🔥 Allow manual trigger from Actions tab
+    - cron: '30 * * * *'  # 🔥 Every hour IST
+  workflow_dispatch:       # 🔥 Manual trigger support
 
 jobs:
   upload-orderflow:
     runs-on: ubuntu-latest
 
     env:
-      RENDER_API_BASE: https://comoflo.onrender.com/api  # 🔥 Replace with your Flask API base URL
-      GITHUB_REPO: vishtheendodoc/comoflo                  # 🔥 Replace with your GitHub username/repo
+      RENDER_API_BASE: https://comoflo.onrender.com/api  # 🔥 Your Flask API base URL
+      GITHUB_REPO: vishtheendodoc/comoflo                # 🔥 Your GitHub username/repo
       DATA_FOLDER: data_snapshots
       GITHUB_TOKEN: ${{ secrets.MY_PAT }}
 
@@ -34,7 +34,7 @@ jobs:
         import requests, pandas as pd
         from datetime import datetime
         from github import Github
-        import os
+        import os, time
 
         # --- Config ---
         api_base = "${{ env.RENDER_API_BASE }}"
@@ -46,32 +46,46 @@ jobs:
         filename = f"orderflow_{now.strftime('%Y%m%d_%H')}.csv"
         remote_path = f"{os.environ['DATA_FOLDER']}/{filename}"
 
+        # --- Helper: Retry GET requests ---
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(max_retries=5)
+        session.mount('https://', adapter)
+        session.mount('http://', adapter)
+
+        def fetch_json(url, timeout=60):
+            for attempt in range(1, 6):
+                try:
+                    print(f"🔄 Attempt {attempt}: {url}")
+                    resp = session.get(url, timeout=timeout)
+                    resp.raise_for_status()
+                    return resp.json()
+                except Exception as e:
+                    print(f"⚠️ Attempt {attempt} failed: {e}")
+                    if attempt < 5:
+                        time.sleep(5 * attempt)  # exponential backoff
+            print(f"❌ Failed after 5 attempts: {url}")
+            return None
+
         # --- Fetch security IDs from /api/stocks ---
         print("📡 Fetching stock list...")
-        try:
-            resp = requests.get(api_stocks, timeout=15)
-            resp.raise_for_status()
-            stock_list = resp.json()
-            security_ids = [str(s['security_id']) for s in stock_list if 'security_id' in s]
-            print(f"✅ Found {len(security_ids)} securities")
-        except Exception as e:
-            print(f"❌ Failed to fetch stock list: {e}")
+        stock_list = fetch_json(api_stocks)
+        if not stock_list:
+            print("❌ Could not fetch stock list. Exiting.")
             exit(1)
+
+        security_ids = [str(s['security_id']) for s in stock_list if 'security_id' in s]
+        print(f"✅ Found {len(security_ids)} securities")
 
         # --- Fetch data for each security ---
         combined_df = pd.DataFrame()
         for sid in security_ids:
-            try:
-                print(f"📥 Fetching data for {sid}")
-                resp = requests.get(f"{api_data}{sid}?interval=1", timeout=15)
-                resp.raise_for_status()
-                data = resp.json()
-                if data:
-                    df = pd.DataFrame(data)
-                    df['security_id'] = sid
-                    combined_df = pd.concat([combined_df, df], ignore_index=True)
-            except Exception as e:
-                print(f"⚠️ Error fetching {sid}: {e}")
+            data = fetch_json(f"{api_data}{sid}?interval=1")
+            if data:
+                df = pd.DataFrame(data)
+                df['security_id'] = sid
+                combined_df = pd.concat([combined_df, df], ignore_index=True)
+            else:
+                print(f"⚠️ Skipped {sid} due to errors")
 
         if combined_df.empty:
             print("⚠️ No data fetched for any security. Skipping upload.")
