@@ -3,4 +3,9 @@ flask-cors
 pandas
 websocket-client
 git+https://github.com/dhan-oss/DhanHQ-py.git@main#egg=dhanhq
-
+numpy
+requests
+python-dateutil
+python-dotenv
+gunicorn
+psutil
