@@ -225,6 +225,20 @@ def marketfeed_thread():
                                     buy_initiated = ltq
                                 elif ltp_val < prev:
                                     sell_initiated = ltq
+                                else:
+                                    bid_price = response.get("bid_price", 0)
+                                    ask_price = response.get("ask_price", 0)
+                                    if bid_price and ask_price:
+                                        if ltp_val >= ask_price:
+                                            buy_initiated = ltq
+                                        elif ltp_val <= bid_price:
+                                            sell_initiated = ltq
+                                        else:
+                                            buy_initiated = ltq / 2
+                                            sell_initiated = ltq / 2
+                                    else:
+                                        buy_initiated = ltq / 2
+                                        sell_initiated = ltq / 2
                             tick_delta = buy_initiated - sell_initiated
                             prev_ltp[security_id] = ltp_val
                             
