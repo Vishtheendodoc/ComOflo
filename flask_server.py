@@ -217,30 +217,49 @@ def marketfeed_thread():
                             ltq = response.get("LTQ", 0)
                             
                             # Tick-rule logic
+                            # 🚀 GoCharting-Style Tick-Rule Logic with Volume De-Duplication
                             prev = prev_ltp[security_id]
+                            prev_total_volume = prev_volume.get(security_id, 0)
+                            current_total_volume = response.get("volume", 0)
+                            delta_volume = current_total_volume - prev_total_volume
+                            prev_volume[security_id] = current_total_volume
+
                             buy_initiated = 0
                             sell_initiated = 0
-                            if prev is not None and ltq:
+
+                            if prev is not None and delta_volume > 0:
                                 if ltp_val > prev:
-                                    buy_initiated = ltq
+                                    # Price uptick → Buyer aggression
+                                    buy_initiated = delta_volume
                                 elif ltp_val < prev:
-                                    sell_initiated = ltq
+                                    # Price downtick → Seller aggression
+                                    sell_initiated = delta_volume
                                 else:
+                                    # Price flat → use Bid/Ask proximity
                                     bid_price = response.get("bid_price", 0)
                                     ask_price = response.get("ask_price", 0)
+
                                     if bid_price and ask_price:
                                         if ltp_val >= ask_price:
-                                            buy_initiated = ltq
+                                            buy_initiated = delta_volume
                                         elif ltp_val <= bid_price:
-                                            sell_initiated = ltq
+                                            sell_initiated = delta_volume
                                         else:
-                                            buy_initiated = ltq / 2
-                                            sell_initiated = ltq / 2
+                                            # Trade between bid/ask → split volume
+                                            buy_initiated = delta_volume / 2
+                                            sell_initiated = delta_volume / 2
                                     else:
-                                        buy_initiated = ltq / 2
-                                        sell_initiated = ltq / 2
+                                        # No bid/ask → split
+                                        buy_initiated = delta_volume / 2
+                                        sell_initiated = delta_volume / 2
+                            else:
+                                # No new volume → skip
+                                buy_initiated = 0
+                                sell_initiated = 0
+
                             tick_delta = buy_initiated - sell_initiated
                             prev_ltp[security_id] = ltp_val
+
                             
                             # Add to batch instead of direct DB write
                             add_to_db_batch(security_id, timestamp, buy, sell, ltp_val, volume, buy_initiated, sell_initiated, tick_delta)
