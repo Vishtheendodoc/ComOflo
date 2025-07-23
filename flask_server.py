@@ -50,6 +50,9 @@ last_reset_date = [None]  # For daily reset
 # Track previous LTP for tick-rule logic
 prev_ltp = defaultdict(lambda: None)
 
+prev_volume = defaultdict(lambda: 0)  # Track previous total volume
+
+
 # Performance monitoring
 stats = {
     'messages_processed': 0,
