@@ -2,7 +2,7 @@ name: Hourly Orderflow Upload
 
 on:
   schedule:
-    - cron: '0,30 * * * *'  # 🔥 Every hour IST
+    - cron: '0 * * * *'  # 🔥 Every hour IST
   workflow_dispatch:       # 🔥 Manual trigger support
 
 jobs:
