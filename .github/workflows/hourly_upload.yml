@@ -2,106 +2,143 @@ name: Hourly Orderflow Upload
 
 on:
   schedule:
-    - cron: '0 * * * *'  # 🔥 Every hour IST
-  workflow_dispatch:       # 🔥 Manual trigger support
+    # Runs every hour at minute 0 UTC (adjust timezone if needed)
+    - cron: '0 * * * *' 
+  workflow_dispatch: # Manual trigger support
 
 jobs:
   upload-orderflow:
     runs-on: ubuntu-latest
 
     env:
-      RENDER_API_BASE: https://comoflo.onrender.com/api  # 🔥 Your Flask API base URL
-      GITHUB_REPO: vishtheendodoc/comoflo                # 🔥 Your GitHub username/repo
+      RENDER_API_BASE: https://comoflo.onrender.com/api  # Flask API base URL
+      GITHUB_REPO: vishtheendodoc/comoflo               # Your GitHub username/repo
       DATA_FOLDER: data_snapshots
       GITHUB_TOKEN: ${{ secrets.MY_PAT }}
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v3
 
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.10'
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
 
-    - name: Install dependencies
-      run: |
-        pip install requests pandas PyGithub
+      - name: Install dependencies
+        run: |
+          pip install requests pandas PyGithub
 
-    - name: Fetch and upload data
-      run: |
-        python - <<EOF
-        import requests, pandas as pd
-        from datetime import datetime
-        from github import Github
-        import os, time
+      - name: Fetch and upload data
+        run: |
+          python - <<EOF
+          import requests
+          import pandas as pd
+          from datetime import datetime
+          from github import Github
+          import os
+          import time
 
-        # --- Config ---
-        api_base = "${{ env.RENDER_API_BASE }}"
-        api_stocks = f"{api_base}/stocks"
-        api_data = f"{api_base}/delta_data/"
-        repo_name = "${{ env.GITHUB_REPO }}"
-        token = os.environ["GITHUB_TOKEN"]
-        now = datetime.utcnow()
-        filename = f"orderflow_{now.strftime('%Y%m%d_%H')}.csv"
-        remote_path = f"{os.environ['DATA_FOLDER']}/{filename}"
+          # --- Config ---
+          api_base = os.getenv("RENDER_API_BASE")
+          api_stocks = f"{api_base}/stocks"
+          api_data = f"{api_base}/delta_data/"
+          repo_name = os.getenv("GITHUB_REPO")
+          token = os.getenv("GITHUB_TOKEN")
+          now = datetime.utcnow()
+          filename = f"orderflow_{now.strftime('%Y%m%d_%H')}.csv"
+          remote_path = f"{os.getenv('DATA_FOLDER')}/{filename}"
 
-        # --- Helper: Retry GET requests ---
-        session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(max_retries=5)
-        session.mount('https://', adapter)
-        session.mount('http://', adapter)
+          # --- Helper: Retry GET requests ---
+          session = requests.Session()
+          adapter = requests.adapters.HTTPAdapter(max_retries=5)
+          session.mount("https://", adapter)
+          session.mount("http://", adapter)
 
-        def fetch_json(url, timeout=60):
-            for attempt in range(1, 6):
-                try:
-                    print(f"🔄 Attempt {attempt}: {url}")
-                    resp = session.get(url, timeout=timeout)
-                    resp.raise_for_status()
-                    return resp.json()
-                except Exception as e:
-                    print(f"⚠️ Attempt {attempt} failed: {e}")
-                    if attempt < 5:
-                        time.sleep(5 * attempt)  # exponential backoff
-            print(f"❌ Failed after 5 attempts: {url}")
-            return None
+          def fetch_json(url, timeout=60):
+              for attempt in range(1, 6):
+                  try:
+                      print(f"🔄 Attempt {attempt}: {url}")
+                      resp = session.get(url, timeout=timeout)
+                      resp.raise_for_status()
+                      return resp.json()
+                  except Exception as e:
+                      print(f"⚠️ Attempt {attempt} failed: {e}")
+                      if attempt < 5:
+                          time.sleep(5 * attempt)  # exponential backoff
+              print(f"❌ Failed after 5 attempts: {url}")
+              return None
 
-        # --- Fetch security IDs from /api/stocks ---
-        print("📡 Fetching stock list...")
-        stock_list = fetch_json(api_stocks)
-        if not stock_list:
-            print("❌ Could not fetch stock list. Exiting.")
-            exit(1)
+          # --- Fetch security IDs ---
+          print("📡 Fetching stock list...")
+          stock_list = fetch_json(api_stocks)
+          if not stock_list:
+              print("❌ Could not fetch stock list. Exiting.")
+              exit(1)
 
-        security_ids = [str(s['security_id']) for s in stock_list if 'security_id' in s]
-        print(f"✅ Found {len(security_ids)} securities")
+          security_ids = [str(s['security_id']) for s in stock_list if 'security_id' in s]
+          print(f"✅ Found {len(security_ids)} securities")
 
-        # --- Fetch data for each security ---
-        combined_df = pd.DataFrame()
-        for sid in security_ids:
-            data = fetch_json(f"{api_data}{sid}?interval=1")
-            if data:
-                df = pd.DataFrame(data)
-                df['security_id'] = sid
-                combined_df = pd.concat([combined_df, df], ignore_index=True)
-            else:
-                print(f"⚠️ Skipped {sid} due to errors")
+          # --- Fetch data for each security ---
+          combined_df = pd.DataFrame()
+          skipped = []
+          for sid in security_ids:
+              data = fetch_json(f"{api_data}{sid}?interval=1")
+              if data:
+                  df = pd.DataFrame(data)
+                  df['security_id'] = sid
+                  combined_df = pd.concat([combined_df, df], ignore_index=True)
+              else:
+                  print(f"⚠️ Skipped {sid} due to errors")
+                  skipped.append(sid)
 
-        if combined_df.empty:
-            print("⚠️ No data fetched for any security. Skipping upload.")
-            exit(0)
+          if combined_df.empty:
+              print("⚠️ No data fetched for any security. Skipping upload.")
+              exit(0)
 
-        combined_df.to_csv(filename, index=False)
-        print(f"✅ Saved snapshot: {filename}")
+          # --- Save CSV atomically ---
+          temp_filename = f"{filename}.tmp"
+          combined_df.to_csv(temp_filename, index=False)
+          os.replace(temp_filename, filename)
+          print(f"✅ Saved snapshot atomically: {filename}")
 
-        # --- Upload to GitHub ---
-        g = Github(token)
-        repo = g.get_repo(repo_name)
-        try:
-            contents = repo.get_contents(remote_path)
-            repo.update_file(contents.path, f"Update {remote_path}", open(filename, "rb").read(), contents.sha)
-            print(f"✅ Updated {remote_path}")
-        except:
-            repo.create_file(remote_path, f"Create {remote_path}", open(filename, "rb").read())
-            print(f"✅ Created {remote_path}")
-        EOF
+          # --- Upload with retry ---
+          g = Github(token)
+          repo = g.get_repo(repo_name)
+
+          def upload_file_with_retry(repo, remote_path, local_filename, commit_msg, max_retries=3):
+              content = open(local_filename, "rb").read()
+              for attempt in range(1, max_retries + 1):
+                  try:
+                      try:
+                          contents = repo.get_contents(remote_path)
+                          repo.update_file(contents.path, commit_msg, content, contents.sha)
+                          print(f"✅ Updated {remote_path}")
+                      except Exception as e:
+                          # Try create file if not exists (404)
+                          if hasattr(e, 'status') and e.status == 404:
+                              repo.create_file(remote_path, commit_msg, content)
+                              print(f"✅ Created {remote_path}")
+                          else:
+                              raise
+                      return True
+                  except Exception as e:
+                      print(f"⚠️ Upload attempt {attempt} failed: {e}")
+                      if attempt < max_retries:
+                          wait_seconds = 10 * attempt
+                          print(f"⏳ Retrying upload in {wait_seconds} seconds...")
+                          time.sleep(wait_seconds)
+                      else:
+                          print(f"❌ Giving up after {max_retries} attempts.")
+                          return False
+
+          success = upload_file_with_retry(repo, remote_path, filename, f"Backup {filename}")
+          if not success:
+              print(f"❌ Backup upload failed for {filename}")
+              # Optional notification can be added here
+              exit(1)
+
+          print(f"🎉 Backup completed successfully: {filename}")
+          if skipped:
+              print(f"⚠️ Skipped securities: {skipped}")
+          EOF
