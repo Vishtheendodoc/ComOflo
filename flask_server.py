@@ -414,6 +414,47 @@ def get_delta_data(security_id):
         stats['errors'] += 1
         return jsonify({"error": "Internal server error"}), 500
 
+@app.route('/api/cumulative_delta/<string:security_id>')
+def get_cumulative_tick_delta(security_id):
+    try:
+        interval = int(request.args.get('interval', 5))
+
+        with sqlite3.connect(DB_FILE) as conn:
+            df = pd.read_sql_query(
+                "SELECT timestamp, tick_delta FROM orderflow WHERE security_id = ? ORDER BY timestamp ASC",
+                conn, params=(security_id,)
+            )
+
+        if df.empty or 'tick_delta' not in df.columns:
+            return jsonify({"security_id": security_id, "cumulative_tick_delta": 0})
+
+        # Convert timestamp if needed
+        if not pd.api.types.is_datetime64_any_dtype(df['timestamp']):
+            df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+            df = df.dropna(subset=['timestamp'])
+
+        # Optional: filter for today only
+        today = datetime.now().date()
+        df = df[df['timestamp'].dt.date == today]
+
+        # Optional: resample by interval (if needed)
+        grouped = df.groupby(pd.Grouper(key='timestamp', freq=f'{interval}min'))
+        tick_deltas = [group['tick_delta'].sum() for _, group in grouped if not group.empty]
+
+        # Calculate cumulative tick delta
+        cumulative_tick_delta = sum(tick_deltas)
+
+        return jsonify({
+            "security_id": security_id,
+            "interval": interval,
+            "cumulative_tick_delta": cumulative_tick_delta
+        })
+
+    except Exception as e:
+        logger.error(f"Error in get_cumulative_tick_delta for {security_id}: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+
 @app.route('/api/stocks')
 def get_stock_list():
     try:
