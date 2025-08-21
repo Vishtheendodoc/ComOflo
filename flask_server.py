@@ -190,9 +190,18 @@ def classify_aggressor(security_id, ltp_val, delta_volume, ltq, response):
     if delta_volume <= 0:
         return 0.0, 0.0
 
-    # Prefer LTQ if present and reasonable; otherwise use delta volume
-    trade_volume = float(ltq) if (ltq is not None and float(ltq) > 0) else float(delta_volume)
-    remainder = max(float(delta_volume) - trade_volume, 0.0)
+    # Prefer LTQ but clamp to delta_volume to avoid over-counting
+    dv = float(delta_volume)
+    if ltq is not None:
+        try:
+            lq = float(ltq)
+        except Exception:
+            lq = 0.0
+    else:
+        lq = 0.0
+
+    trade_volume = dv if lq <= 0 else min(lq, dv)
+    remainder = max(dv - trade_volume, 0.0)
 
     # Reference price: last different trade price; fallback to last trade price
     ref_price = last_diff_trade_price[security_id] if last_diff_trade_price[security_id] is not None else last_trade_price[security_id]
