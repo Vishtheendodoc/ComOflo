@@ -13,6 +13,7 @@ from dhanhq import DhanContext, MarketFeed
 import sqlite3
 import pandas as pd
 
+
 # --- CONFIG ---
 API_BATCH_SIZE = 5          # Number of stocks per batch API call
 BATCH_INTERVAL_SEC = 5      # Wait time between batches
@@ -125,6 +126,114 @@ def init_db():
 
 init_db()
 
+"""
+Best Bid/Offer extraction and microstructure helpers
+"""
+
+# Track microstructure state
+last_trade_price = defaultdict(lambda: None)              # Last trade price seen
+last_diff_trade_price = defaultdict(lambda: None)         # Last trade price different from current
+
+def _first(d, keys, default=None):
+    for k in keys:
+        if k in d and d[k] is not None:
+            try:
+                return float(d[k])
+            except Exception:
+                return d[k]
+    return default
+
+def extract_bbo(msg):
+    """Extract bid/ask price and quantities from a heterogeneous feed payload.
+    Returns: (bid_price, ask_price, bid_qty, ask_qty) as floats or None.
+    """
+    bid_price = _first(msg, [
+        "bid_price", "best_bid_price", "BestBidPrice", "BID_PRICE", "bid"
+    ])
+    ask_price = _first(msg, [
+        "ask_price", "best_ask_price", "BestAskPrice", "ASK_PRICE", "ask"
+    ])
+    # Prefer top of book sizes; fall back to totals if not available
+    bid_qty = _first(msg, [
+        "bid_qty", "best_bid_qty", "best_bid_quantity", "BestBidQty", "BID_QTY"
+    ])
+    ask_qty = _first(msg, [
+        "ask_qty", "best_ask_qty", "best_ask_quantity", "BestAskQty", "ASK_QTY"
+    ])
+
+    if bid_qty is None:
+        bid_qty = _first(msg, ["total_buy_quantity", "TotalBuyQty"])  # fall back
+    if ask_qty is None:
+        ask_qty = _first(msg, ["total_sell_quantity", "TotalSellQty"])  # fall back
+
+    return bid_price, ask_price, (float(bid_qty) if bid_qty is not None else None), (float(ask_qty) if ask_qty is not None else None)
+
+def microprice(bid_price, ask_price, bid_qty, ask_qty):
+    """Compute microprice weighted by opposite queue sizes. Returns None if not computable."""
+    try:
+        if bid_price is None or ask_price is None:
+            return None
+        if bid_qty is None or ask_qty is None or (bid_qty + ask_qty) <= 0:
+            return (bid_price + ask_price) / 2.0
+        # Standard microprice formula
+        return (ask_price * bid_qty + bid_price * ask_qty) / (bid_qty + ask_qty)
+    except Exception:
+        return None
+
+def classify_aggressor(security_id, ltp_val, delta_volume, ltq, response):
+    """Lee-Ready-style classification with tick test and quote test fallbacks.
+    - Uses last-different trade price when available
+    - Uses LTQ preferentially; falls back to total volume delta
+    - Uses quote test and microprice when price unchanged
+    Returns (buy_initiated, sell_initiated)
+    """
+    if delta_volume <= 0:
+        return 0.0, 0.0
+
+    # Prefer LTQ if present and reasonable; otherwise use delta volume
+    trade_volume = float(ltq) if (ltq is not None and float(ltq) > 0) else float(delta_volume)
+    remainder = max(float(delta_volume) - trade_volume, 0.0)
+
+    # Reference price: last different trade price; fallback to last trade price
+    ref_price = last_diff_trade_price[security_id] if last_diff_trade_price[security_id] is not None else last_trade_price[security_id]
+
+    bid_p, ask_p, bid_q, ask_q = extract_bbo(response)
+    mpx = microprice(bid_p, ask_p, bid_q, ask_q)
+
+    buy_init = 0.0
+    sell_init = 0.0
+
+    direction = 0  # +1 buy, -1 sell, 0 unknown
+    if ref_price is not None:
+        if ltp_val > ref_price:
+            direction = +1
+        elif ltp_val < ref_price:
+            direction = -1
+        else:
+            # Quote test / microprice when unchanged
+            if bid_p is not None and ask_p is not None:
+                if ltp_val >= ask_p:
+                    direction = +1
+                elif ltp_val <= bid_p:
+                    direction = -1
+                elif mpx is not None:
+                    direction = +1 if ltp_val >= mpx else -1
+            # else remain unknown
+
+    # Allocate volume based on direction
+    if direction > 0:
+        buy_init += trade_volume
+        buy_init += remainder
+    elif direction < 0:
+        sell_init += trade_volume
+        sell_init += remainder
+    else:
+        # Unknown: split
+        buy_init += (trade_volume + remainder) / 2.0
+        sell_init += (trade_volume + remainder) / 2.0
+
+    return buy_init, sell_init
+
 def store_in_db_batch(batch_data):
     """Store multiple records in database at once"""
     try:
@@ -219,48 +328,33 @@ def marketfeed_thread():
                             volume = response.get("volume", 0)
                             ltq = response.get("LTQ", 0)
                             
-                            # Tick-rule logic
-                            # 🚀 GoCharting-Style Tick-Rule Logic with Volume De-Duplication
-                            prev = prev_ltp[security_id]
+                            # Robust aggressor classification (Lee-Ready + microprice)
+                            prev_price = prev_ltp[security_id]
                             prev_total_volume = prev_volume.get(security_id, 0)
-                            current_total_volume = response.get("volume", 0)
+                            current_total_volume = response.get("volume", 0) or 0
                             delta_volume = current_total_volume - prev_total_volume
-                            prev_volume[security_id] = current_total_volume
 
-                            buy_initiated = 0
-                            sell_initiated = 0
+                            # Handle session reset or volume rollovers
+                            if delta_volume < 0:
+                                prev_volume[security_id] = current_total_volume
+                                delta_volume = 0
 
-                            if prev is not None and delta_volume > 0:
-                                if ltp_val > prev:
-                                    # Price uptick → Buyer aggression
-                                    buy_initiated = delta_volume
-                                elif ltp_val < prev:
-                                    # Price downtick → Seller aggression
-                                    sell_initiated = delta_volume
-                                else:
-                                    # Price flat → use Bid/Ask proximity
-                                    bid_price = response.get("bid_price", 0)
-                                    ask_price = response.get("ask_price", 0)
+                            buy_initiated = 0.0
+                            sell_initiated = 0.0
 
-                                    if bid_price and ask_price:
-                                        if ltp_val >= ask_price:
-                                            buy_initiated = delta_volume
-                                        elif ltp_val <= bid_price:
-                                            sell_initiated = delta_volume
-                                        else:
-                                            # Trade between bid/ask → split volume
-                                            buy_initiated = delta_volume / 2
-                                            sell_initiated = delta_volume / 2
-                                    else:
-                                        # No bid/ask → split
-                                        buy_initiated = delta_volume / 2
-                                        sell_initiated = delta_volume / 2
-                            else:
-                                # No new volume → skip
-                                buy_initiated = 0
-                                sell_initiated = 0
+                            if delta_volume > 0:
+                                # Use last-different price reference captured prior to updating state
+                                buy_initiated, sell_initiated = classify_aggressor(
+                                    security_id, ltp_val, delta_volume, ltq, response
+                                )
 
                             tick_delta = buy_initiated - sell_initiated
+
+                            # Update state after classification
+                            prev_volume[security_id] = current_total_volume
+                            if last_trade_price[security_id] is not None and ltp_val != last_trade_price[security_id]:
+                                last_diff_trade_price[security_id] = last_trade_price[security_id]
+                            last_trade_price[security_id] = ltp_val
                             prev_ltp[security_id] = ltp_val
 
                             
