@@ -24,4 +24,3 @@ jobs:
           git add -A
           git commit -m "Daily cleanup: $(date '+%Y-%m-%d %H:%M:%S %Z')" || echo "No changes to commit"
           git push
-
