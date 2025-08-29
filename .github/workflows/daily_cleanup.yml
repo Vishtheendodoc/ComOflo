@@ -2,8 +2,11 @@ name: Daily data_snapshots Cleanup
 
 on:
   schedule:
-    - cron: '30 1 * * *'  # Runs daily at 07:00 IST (01:30 UTC)
+    - cron: '30 2 * * *'  # Runs daily at 08:00 IST (02:30 UTC)
   workflow_dispatch:       # Allow manual trigger from GitHub UI
+
+permissions:
+  contents: write   # Needed for git push
 
 jobs:
   cleanup:
@@ -24,3 +27,5 @@ jobs:
           git add -A
           git commit -m "Daily cleanup: $(date '+%Y-%m-%d %H:%M:%S %Z')" || echo "No changes to commit"
           git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
