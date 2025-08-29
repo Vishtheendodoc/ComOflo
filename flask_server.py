@@ -38,8 +38,6 @@ if ENVIRONMENT == 'production':
 # --- FLASK SETUP ---
 app = Flask(__name__)
 CORS(app)
-
-# Set Flask debug mode based on environment
 app.config['DEBUG'] = ENVIRONMENT != 'production'
 
 # Global variables
@@ -49,9 +47,7 @@ last_reset_date = [None]  # For daily reset
 
 # Track previous LTP for tick-rule logic
 prev_ltp = defaultdict(lambda: None)
-
-prev_volume = defaultdict(lambda: 0)  # Track previous total volume
-
+prev_volume = defaultdict(lambda: 0)
 
 # Performance monitoring
 stats = {
@@ -69,10 +65,9 @@ db_batch_lock = threading.Lock()
 
 # --- Initialize Dhan API Analyzer ---
 CLIENT_ID = "1100244268"
-ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzU2Mjk2NDY0LCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwMDI0NDI2OCJ9.OeP6vi2JlsYTNM8QkW-otqCiN0RnWOdddrJ-1rsFUUo7SBGx_emR__zzBi67vjRvQ7I2Pl2GtCaJvkh13h0DOw"
+ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzU2Mjk2NDY0LCJ0b2tlbkNvbnN1bW1lclR5cGUiOiJTRUxGIiwid2ViaG9va1VybCI6IiIsImRoYW5DbGllbnRJZCI6IjExMDAyNDQyNjgifQ.OeP6vi2JlsYTNM8QkW-otqCiN0RnWOdddrJ-1rsFUUo7SBGx_emR__zzBi67vjRvQ7I2Pl2GtCaJvkh13h0DOw"
 analyzer = OrderFlowAnalyzer(CLIENT_ID, ACCESS_TOKEN)
 
-# Prepare instrument list from your stock_list.csv
 def get_instrument_list():
     stocks = []
     try:
@@ -83,11 +78,10 @@ def get_instrument_list():
                 seg = row.get("segment")
                 instr = row.get("instrument")
                 sec_id = str(row["security_id"])
-                # Map to MarketFeed enums/constants
                 if exch == "NSE" and seg == "D":
                     stocks.append((MarketFeed.NSE_FNO, sec_id, MarketFeed.Quote))
                 elif exch == "MCX" and seg == "M":
-                    stocks.append(("MCX_COMM", sec_id, MarketFeed.Quote))  # Use string for MCX
+                    stocks.append(("MCX_COMM", sec_id, MarketFeed.Quote))
         logger.info(f"Loaded {len(stocks)} instruments from {STOCK_LIST_FILE}")
     except Exception as e:
         logger.error(f"Failed to load instrument list: {e}")
@@ -95,7 +89,6 @@ def get_instrument_list():
     return stocks
 
 instrument_list = get_instrument_list()
-
 dhan_context = DhanContext(CLIENT_ID, ACCESS_TOKEN)
 market_feed = MarketFeed(dhan_context, instrument_list, "v2")
 
@@ -116,7 +109,6 @@ def init_db():
                     tick_delta REAL
                 )
             ''')
-            # Create index for faster queries
             conn.execute('CREATE INDEX IF NOT EXISTS idx_security_timestamp ON orderflow(security_id, timestamp)')
         logger.info("Database initialized successfully")
     except Exception as e:
@@ -126,7 +118,6 @@ def init_db():
 init_db()
 
 def store_in_db_batch(batch_data):
-    """Store multiple records in database at once"""
     try:
         with sqlite3.connect(DB_FILE) as conn:
             conn.executemany(
@@ -140,73 +131,69 @@ def store_in_db_batch(batch_data):
         stats['errors'] += 1
 
 def add_to_db_batch(security_id, timestamp, buy, sell, ltp, volume, buy_initiated=None, sell_initiated=None, tick_delta=None):
-    """Add record to batch for later database insertion"""
     global db_batch
-    
     with db_batch_lock:
         db_batch.append((security_id, timestamp, buy, sell, ltp, volume, buy_initiated, sell_initiated, tick_delta))
-        
-        # Write batch when it reaches the threshold
         if len(db_batch) >= DB_BATCH_SIZE:
             store_in_db_batch(db_batch.copy())
             db_batch.clear()
 
 def flush_db_batch():
-    """Force write remaining batch data"""
     global db_batch
-    
     with db_batch_lock:
         if db_batch:
             store_in_db_batch(db_batch.copy())
             db_batch.clear()
 
 def marketfeed_thread():
-    global stats
-    
+    backoff_sec = 5
+    min_reconnect_delay = 5
+    max_reconnect_delay = 300  # Max 5 minutes
+    last_api_call_time = 0
+    api_call_interval = 1.0 / 5  # 5 requests per second per Dhan API limits
+
     while True:
         try:
-            market_feed.run_forever()
-            # Continuously fetch and update live_market_data and orderflow_history
+            market_feed.run_forever()  # blocks until disconnect
+            backoff_sec = min_reconnect_delay  # reset backoff on success
+
             while True:
+                now = time.time()
+                elapsed = now - last_api_call_time
+                if elapsed < api_call_interval:
+                    time.sleep(api_call_interval - elapsed)  # throttle API calls
+                last_api_call_time = time.time()
+
                 response = market_feed.get_data()
-                
-                # Removed heavy logging - only log in debug mode
-                logger.debug(f"Received market feed response for security: {response.get('security_id') if response else 'None'}")
 
                 if response and isinstance(response, dict):
                     required_keys = ["security_id"]
                     missing_keys = [key for key in required_keys if key not in response]
-                    
                     if missing_keys:
                         logger.error(f"Missing keys {missing_keys} in response")
                         stats['errors'] += 1
                         continue
-                    
+
                     security_id = str(response.get("security_id"))
                     if not security_id:
                         logger.warning("Empty security_id in response")
                         stats['errors'] += 1
                         continue
 
-                    # Update stats
                     stats['messages_processed'] += 1
-                    
-                    # Periodic logging instead of per-message logging
-                    if stats['messages_processed'] % 1000 == 0:
-                        logger.info(f"Processed {stats['messages_processed']} messages, {stats['errors']} errors, {stats['db_writes']} DB writes")
 
-                    # Update live data
+                    if stats['messages_processed'] % 1000 == 0:
+                        logger.info(f"Processed {stats['messages_processed']} messages, errors {stats['errors']}, DB writes {stats['db_writes']}")
+
                     live_market_data[security_id] = response
-                    
-                    # Update history
+
                     if security_id not in orderflow_history:
                         orderflow_history[security_id] = []
                     orderflow_history[security_id].append(response)
-                    
-                    # Keep history size manageable
-                    if len(orderflow_history[security_id]) > 10000:  # Keep last 10k records
-                        orderflow_history[security_id] = orderflow_history[security_id][-5000:]  # Trim to 5k
-                    
+
+                    if len(orderflow_history[security_id]) > 10000:
+                        orderflow_history[security_id] = orderflow_history[security_id][-5000:]
+
                     # Store Quote Data in DB (batched)
                     if response.get('type') == 'Quote Data':
                         try:
@@ -217,75 +204,56 @@ def marketfeed_thread():
                             sell = response.get("total_sell_quantity", 0)
                             ltp_val = float(response.get("LTP", 0))
                             volume = response.get("volume", 0)
-                            ltq = response.get("LTQ", 0)
-                            
-                            # Tick-rule logic
-                            # 🚀 GoCharting-Style Tick-Rule Logic with Volume De-Duplication
+
                             prev = prev_ltp[security_id]
                             prev_total_volume = prev_volume.get(security_id, 0)
-                            current_total_volume = response.get("volume", 0)
+                            current_total_volume = volume
                             delta_volume = current_total_volume - prev_total_volume
                             prev_volume[security_id] = current_total_volume
-
                             buy_initiated = 0
                             sell_initiated = 0
-
                             if prev is not None and delta_volume > 0:
                                 if ltp_val > prev:
-                                    # Price uptick → Buyer aggression
                                     buy_initiated = delta_volume
                                 elif ltp_val < prev:
-                                    # Price downtick → Seller aggression
                                     sell_initiated = delta_volume
                                 else:
-                                    # Price flat → use Bid/Ask proximity
                                     bid_price = response.get("bid_price", 0)
                                     ask_price = response.get("ask_price", 0)
-
                                     if bid_price and ask_price:
                                         if ltp_val >= ask_price:
                                             buy_initiated = delta_volume
                                         elif ltp_val <= bid_price:
                                             sell_initiated = delta_volume
                                         else:
-                                            # Trade between bid/ask → split volume
                                             buy_initiated = delta_volume / 2
                                             sell_initiated = delta_volume / 2
                                     else:
-                                        # No bid/ask → split
                                         buy_initiated = delta_volume / 2
                                         sell_initiated = delta_volume / 2
-                            else:
-                                # No new volume → skip
-                                buy_initiated = 0
-                                sell_initiated = 0
-
                             tick_delta = buy_initiated - sell_initiated
                             prev_ltp[security_id] = ltp_val
 
-                            
-                            # Add to batch instead of direct DB write
                             add_to_db_batch(security_id, timestamp, buy, sell, ltp_val, volume, buy_initiated, sell_initiated, tick_delta)
-                            
+
                         except Exception as e:
                             logger.error(f"Error processing quote data for {security_id}: {e}")
                             stats['errors'] += 1
-                
-                time.sleep(0.01)
-                
-        except Exception as e:
-            logger.error(f"Marketfeed thread crashed: {e}. Restarting in 5 seconds...")
-            stats['errors'] += 1
-            time.sleep(5)  # Increased restart delay
 
-# Start the market feed in a background thread
+                time.sleep(0.01)
+
+        except Exception as e:
+            logger.error(f"Marketfeed thread crashed: {e}. Restarting in {backoff_sec} seconds...")
+            stats['errors'] += 1
+            time.sleep(backoff_sec)
+            backoff_sec = min(backoff_sec * 2, max_reconnect_delay)
+
 marketfeed_thread_obj = threading.Thread(target=marketfeed_thread, daemon=True)
 marketfeed_thread_obj.start()
 
-# Periodic batch flush thread
 def batch_flush_thread():
     while True:
-        time.sleep(30)  # Flush every 30 seconds
+        time.sleep(30)
         flush_db_batch()
 
 threading.Thread(target=batch_flush_thread, daemon=True).start()
@@ -293,7 +261,6 @@ threading.Thread(target=batch_flush_thread, daemon=True).start()
 def maybe_reset_history():
     now = datetime.now()
     today_str = now.strftime('%Y-%m-%d')
-
     if last_reset_date[0] != today_str and now.strftime('%H:%M') >= RESET_TIME:
         delta_history.clear()
         last_reset_date[0] = today_str
@@ -318,19 +285,14 @@ def get_delta_data(security_id):
         interval = int(request.args.get('interval', 5))
     except (ValueError, TypeError):
         interval = 5
-    
     try:
-        # Query from SQLite DB
         with sqlite3.connect(DB_FILE) as conn:
             df = pd.read_sql_query(
                 "SELECT * FROM orderflow WHERE security_id = ? ORDER BY timestamp ASC",
                 conn, params=(security_id,)
             )
-        
         if df.empty:
             return jsonify([])
-        
-        # Convert timestamp to datetime if needed
         if not pd.api.types.is_datetime64_any_dtype(df['timestamp']):
             try:
                 df['timestamp'] = pd.to_datetime(df['timestamp'], format='%Y-%m-%d %H:%M:%S', errors='coerce')
@@ -338,11 +300,9 @@ def get_delta_data(security_id):
             except Exception:
                 logger.error(f"Timestamp parsing failed for security {security_id}")
                 return jsonify([])
-
         df['minute'] = df['timestamp'].dt.strftime('%H:%M')
         buckets = []
         grouped = df.groupby(pd.Grouper(key='timestamp', freq=f'{interval}min'))
-        
         for bucket_label, group in grouped:
             if len(group) >= 2:
                 start = group.iloc[0]
@@ -350,13 +310,9 @@ def get_delta_data(security_id):
                 buy_delta = end['buy_volume'] - start['buy_volume']
                 sell_delta = end['sell_volume'] - start['sell_volume']
                 delta = buy_delta - sell_delta
-                
-                # Tick-rule aggregation
                 buy_initiated_sum = group['buy_initiated'].sum()
                 sell_initiated_sum = group['sell_initiated'].sum()
                 tick_delta_sum = group['tick_delta'].sum()
-                
-                # Inference
                 threshold = 0
                 if tick_delta_sum > threshold:
                     inference = "Buy Dominant"
@@ -364,8 +320,6 @@ def get_delta_data(security_id):
                     inference = "Sell Dominant"
                 else:
                     inference = "Neutral"
-                
-                # OHLC from LTP
                 ohlc = group['ltp'].dropna()
                 if not ohlc.empty:
                     open_ = ohlc.iloc[0]
@@ -374,7 +328,6 @@ def get_delta_data(security_id):
                     close_ = ohlc.iloc[-1]
                 else:
                     open_ = high_ = low_ = close_ = None
-                
                 buckets.append({
                     'timestamp': bucket_label.strftime('%H:%M'),
                     'buy_volume': buy_delta,
@@ -406,9 +359,7 @@ def get_delta_data(security_id):
                     'low': ohlc,
                     'close': ohlc
                 })
-        
         return jsonify(buckets)
-    
     except Exception as e:
         logger.error(f"Error in get_delta_data for {security_id}: {e}")
         stats['errors'] += 1
@@ -418,42 +369,29 @@ def get_delta_data(security_id):
 def get_cumulative_tick_delta(security_id):
     try:
         interval = int(request.args.get('interval', 5))
-
         with sqlite3.connect(DB_FILE) as conn:
             df = pd.read_sql_query(
                 "SELECT timestamp, tick_delta FROM orderflow WHERE security_id = ? ORDER BY timestamp ASC",
                 conn, params=(security_id,)
             )
-
         if df.empty or 'tick_delta' not in df.columns:
             return jsonify({"security_id": security_id, "cumulative_tick_delta": 0})
-
-        # Convert timestamp if needed
         if not pd.api.types.is_datetime64_any_dtype(df['timestamp']):
             df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
             df = df.dropna(subset=['timestamp'])
-
-        # Optional: filter for today only
         today = datetime.now().date()
         df = df[df['timestamp'].dt.date == today]
-
-        # Optional: resample by interval (if needed)
         grouped = df.groupby(pd.Grouper(key='timestamp', freq=f'{interval}min'))
         tick_deltas = [group['tick_delta'].sum() for _, group in grouped if not group.empty]
-
-        # Calculate cumulative tick delta
         cumulative_tick_delta = sum(tick_deltas)
-
         return jsonify({
             "security_id": security_id,
             "interval": interval,
             "cumulative_tick_delta": cumulative_tick_delta
         })
-
     except Exception as e:
         logger.error(f"Error in get_cumulative_tick_delta for {security_id}: {e}")
         return jsonify({"error": "Internal server error"}), 500
-
 
 @app.route('/api/stocks')
 def get_stock_list():
@@ -470,12 +408,9 @@ def get_stock_list():
 def get_live_data(security_id):
     stats['api_calls'] += 1
     data = live_market_data.get(security_id)
-    
-    # Removed heavy logging - only log in debug mode or when there's no data
     if not data:
         logger.debug(f"No live data available for security_id: {security_id}")
         return jsonify({"error": "No live data"}), 404
-    
     return jsonify(data)
 
 @app.route('/api/orderflow_history/<string:security_id>')
@@ -486,7 +421,6 @@ def get_orderflow_history(security_id):
 
 @app.route('/api/stats')
 def get_stats():
-    """Monitoring endpoint for system health"""
     current_stats = stats.copy()
     current_stats['uptime_seconds'] = (datetime.now() - datetime.fromisoformat(stats['start_time'])).total_seconds()
     current_stats['db_batch_size'] = len(db_batch)
@@ -495,7 +429,6 @@ def get_stats():
 
 @app.route('/api/health')
 def health_check():
-    """Health check endpoint for monitoring"""
     return jsonify({
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
@@ -515,12 +448,10 @@ def dashboard():
     <p><a href="/api/stats">Stats</a> | <a href="/api/health">Health</a></p>
     """
 
-# Graceful shutdown
 import atexit
-
 def cleanup():
     logger.info("Shutting down gracefully...")
-    flush_db_batch()  # Ensure all data is written before shutdown
+    flush_db_batch()
 
 atexit.register(cleanup)
 
