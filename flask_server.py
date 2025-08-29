@@ -5,6 +5,8 @@ import time
 import os
 import logging
 from datetime import datetime
+import asyncio
+import nest_asyncio
 from orderflow import OrderFlowAnalyzer, live_market_data, orderflow_history
 import csv
 from collections import defaultdict
@@ -12,13 +14,20 @@ import math
 from dhanhq import DhanContext, MarketFeed
 import sqlite3
 import pandas as pd
+import signal
+import sys
+
+# Enable nested event loops for async compatibility
+nest_asyncio.apply()
 
 # --- CONFIG ---
 API_BATCH_SIZE = 5          # Number of stocks per batch API call
-BATCH_INTERVAL_SEC = 5      # Wait time between batches
+BATCH_INTERVAL_SEC = 30     # Increased interval to avoid rate limits
 RESET_TIME = "09:15"        # Clear delta_history daily at this time
 STOCK_LIST_FILE = "stock_list.csv"
 DB_FILE = "orderflow_data.db"
+MAX_RECONNECT_ATTEMPTS = 3  # Limit reconnection attempts
+RECONNECT_BACKOFF = [30, 60, 120]  # Progressive backoff in seconds
 
 # --- LOGGING SETUP ---
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()
@@ -49,9 +58,13 @@ last_reset_date = [None]  # For daily reset
 
 # Track previous LTP for tick-rule logic
 prev_ltp = defaultdict(lambda: None)
-
 prev_volume = defaultdict(lambda: 0)  # Track previous total volume
 
+# Market feed state management
+market_feed_active = False
+market_feed_task = None
+reconnect_attempts = 0
+last_connection_time = 0
 
 # Performance monitoring
 stats = {
@@ -59,18 +72,26 @@ stats = {
     'api_calls': 0,
     'errors': 0,
     'db_writes': 0,
+    'reconnect_attempts': 0,
+    'last_successful_connection': None,
+    'connection_status': 'disconnected',
     'start_time': datetime.now().isoformat()
 }
 
 # Batch processing for database writes
 db_batch = []
-DB_BATCH_SIZE = 100
+DB_BATCH_SIZE = 50  # Reduced for more frequent writes
 db_batch_lock = threading.Lock()
 
 # --- Initialize Dhan API Analyzer ---
 CLIENT_ID = "1100244268"
 ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzU4OTQ5MjcwLCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwMDI0NDI2OCJ9.xjTrEBxvCxX8kf6P3ZrfvJupkdNBNhL9A2Tf9jrz4UkQ52rz2Jzqj9kX1POdYULPuJp6dFYQ68TL3kQWZImvAg"
-analyzer = OrderFlowAnalyzer(CLIENT_ID, ACCESS_TOKEN)
+
+try:
+    analyzer = OrderFlowAnalyzer(CLIENT_ID, ACCESS_TOKEN)
+except Exception as e:
+    logger.error(f"Failed to initialize OrderFlowAnalyzer: {e}")
+    analyzer = None
 
 # Prepare instrument list from your stock_list.csv
 def get_instrument_list():
@@ -92,12 +113,26 @@ def get_instrument_list():
     except Exception as e:
         logger.error(f"Failed to load instrument list: {e}")
         stats['errors'] += 1
+        # Return a minimal list to prevent crashes
+        return [(MarketFeed.NSE_FNO, "26000", MarketFeed.Quote)]  # NIFTY 50 as fallback
     return stocks
 
 instrument_list = get_instrument_list()
 
-dhan_context = DhanContext(CLIENT_ID, ACCESS_TOKEN)
-market_feed = MarketFeed(dhan_context, instrument_list, "v2")
+# Initialize market feed context
+dhan_context = None
+market_feed = None
+
+def init_market_feed():
+    global dhan_context, market_feed
+    try:
+        dhan_context = DhanContext(CLIENT_ID, ACCESS_TOKEN)
+        market_feed = MarketFeed(dhan_context, instrument_list, "v2")
+        logger.info("Market feed initialized successfully")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to initialize market feed: {e}")
+        return False
 
 def init_db():
     try:
@@ -160,132 +195,201 @@ def flush_db_batch():
             store_in_db_batch(db_batch.copy())
             db_batch.clear()
 
-def marketfeed_thread():
+def process_market_data(response):
+    """Process individual market data response"""
     global stats
     
-    while True:
+    if not response or not isinstance(response, dict):
+        return
+        
+    required_keys = ["security_id"]
+    missing_keys = [key for key in required_keys if key not in response]
+    
+    if missing_keys:
+        logger.error(f"Missing keys {missing_keys} in response")
+        stats['errors'] += 1
+        return
+    
+    security_id = str(response.get("security_id"))
+    if not security_id:
+        logger.warning("Empty security_id in response")
+        stats['errors'] += 1
+        return
+
+    # Update stats
+    stats['messages_processed'] += 1
+    
+    # Periodic logging instead of per-message logging
+    if stats['messages_processed'] % 1000 == 0:
+        logger.info(f"Processed {stats['messages_processed']} messages, {stats['errors']} errors, {stats['db_writes']} DB writes")
+
+    # Update live data
+    live_market_data[security_id] = response
+    
+    # Update history
+    if security_id not in orderflow_history:
+        orderflow_history[security_id] = []
+    orderflow_history[security_id].append(response)
+    
+    # Keep history size manageable
+    if len(orderflow_history[security_id]) > 10000:  # Keep last 10k records
+        orderflow_history[security_id] = orderflow_history[security_id][-5000:]  # Trim to 5k
+    
+    # Store Quote Data in DB (batched)
+    if response.get('type') == 'Quote Data':
         try:
-            market_feed.run_forever()
-            # Continuously fetch and update live_market_data and orderflow_history
-            while True:
-                response = market_feed.get_data()
-                
-                # Removed heavy logging - only log in debug mode
-                logger.debug(f"Received market feed response for security: {response.get('security_id') if response else 'None'}")
+            ltt = response.get("LTT")
+            today = datetime.now().strftime('%Y-%m-%d')
+            timestamp = f"{today} {ltt}" if ltt else datetime.now().isoformat()
+            buy = response.get("total_buy_quantity", 0)
+            sell = response.get("total_sell_quantity", 0)
+            ltp_val = float(response.get("LTP", 0))
+            volume = response.get("volume", 0)
+            ltq = response.get("LTQ", 0)
+            
+            # Tick-rule logic with volume de-duplication
+            prev = prev_ltp[security_id]
+            prev_total_volume = prev_volume.get(security_id, 0)
+            current_total_volume = response.get("volume", 0)
+            delta_volume = current_total_volume - prev_total_volume
+            prev_volume[security_id] = current_total_volume
 
-                if response and isinstance(response, dict):
-                    required_keys = ["security_id"]
-                    missing_keys = [key for key in required_keys if key not in response]
-                    
-                    if missing_keys:
-                        logger.error(f"Missing keys {missing_keys} in response")
-                        stats['errors'] += 1
-                        continue
-                    
-                    security_id = str(response.get("security_id"))
-                    if not security_id:
-                        logger.warning("Empty security_id in response")
-                        stats['errors'] += 1
-                        continue
+            buy_initiated = 0
+            sell_initiated = 0
 
-                    # Update stats
-                    stats['messages_processed'] += 1
-                    
-                    # Periodic logging instead of per-message logging
-                    if stats['messages_processed'] % 1000 == 0:
-                        logger.info(f"Processed {stats['messages_processed']} messages, {stats['errors']} errors, {stats['db_writes']} DB writes")
+            if prev is not None and delta_volume > 0:
+                if ltp_val > prev:
+                    # Price uptick → Buyer aggression
+                    buy_initiated = delta_volume
+                elif ltp_val < prev:
+                    # Price downtick → Seller aggression
+                    sell_initiated = delta_volume
+                else:
+                    # Price flat → use Bid/Ask proximity
+                    bid_price = response.get("bid_price", 0)
+                    ask_price = response.get("ask_price", 0)
 
-                    # Update live data
-                    live_market_data[security_id] = response
-                    
-                    # Update history
-                    if security_id not in orderflow_history:
-                        orderflow_history[security_id] = []
-                    orderflow_history[security_id].append(response)
-                    
-                    # Keep history size manageable
-                    if len(orderflow_history[security_id]) > 10000:  # Keep last 10k records
-                        orderflow_history[security_id] = orderflow_history[security_id][-5000:]  # Trim to 5k
-                    
-                    # Store Quote Data in DB (batched)
-                    if response.get('type') == 'Quote Data':
-                        try:
-                            ltt = response.get("LTT")
-                            today = datetime.now().strftime('%Y-%m-%d')
-                            timestamp = f"{today} {ltt}" if ltt else datetime.now().isoformat()
-                            buy = response.get("total_buy_quantity", 0)
-                            sell = response.get("total_sell_quantity", 0)
-                            ltp_val = float(response.get("LTP", 0))
-                            volume = response.get("volume", 0)
-                            ltq = response.get("LTQ", 0)
-                            
-                            # Tick-rule logic
-                            # 🚀 GoCharting-Style Tick-Rule Logic with Volume De-Duplication
-                            prev = prev_ltp[security_id]
-                            prev_total_volume = prev_volume.get(security_id, 0)
-                            current_total_volume = response.get("volume", 0)
-                            delta_volume = current_total_volume - prev_total_volume
-                            prev_volume[security_id] = current_total_volume
+                    if bid_price and ask_price:
+                        if ltp_val >= ask_price:
+                            buy_initiated = delta_volume
+                        elif ltp_val <= bid_price:
+                            sell_initiated = delta_volume
+                        else:
+                            # Trade between bid/ask → split volume
+                            buy_initiated = delta_volume / 2
+                            sell_initiated = delta_volume / 2
+                    else:
+                        # No bid/ask → split
+                        buy_initiated = delta_volume / 2
+                        sell_initiated = delta_volume / 2
 
-                            buy_initiated = 0
-                            sell_initiated = 0
-
-                            if prev is not None and delta_volume > 0:
-                                if ltp_val > prev:
-                                    # Price uptick → Buyer aggression
-                                    buy_initiated = delta_volume
-                                elif ltp_val < prev:
-                                    # Price downtick → Seller aggression
-                                    sell_initiated = delta_volume
-                                else:
-                                    # Price flat → use Bid/Ask proximity
-                                    bid_price = response.get("bid_price", 0)
-                                    ask_price = response.get("ask_price", 0)
-
-                                    if bid_price and ask_price:
-                                        if ltp_val >= ask_price:
-                                            buy_initiated = delta_volume
-                                        elif ltp_val <= bid_price:
-                                            sell_initiated = delta_volume
-                                        else:
-                                            # Trade between bid/ask → split volume
-                                            buy_initiated = delta_volume / 2
-                                            sell_initiated = delta_volume / 2
-                                    else:
-                                        # No bid/ask → split
-                                        buy_initiated = delta_volume / 2
-                                        sell_initiated = delta_volume / 2
-                            else:
-                                # No new volume → skip
-                                buy_initiated = 0
-                                sell_initiated = 0
-
-                            tick_delta = buy_initiated - sell_initiated
-                            prev_ltp[security_id] = ltp_val
-
-                            
-                            # Add to batch instead of direct DB write
-                            add_to_db_batch(security_id, timestamp, buy, sell, ltp_val, volume, buy_initiated, sell_initiated, tick_delta)
-                            
-                        except Exception as e:
-                            logger.error(f"Error processing quote data for {security_id}: {e}")
-                            stats['errors'] += 1
-                
-                time.sleep(0.01)
-                
+            tick_delta = buy_initiated - sell_initiated
+            prev_ltp[security_id] = ltp_val
+            
+            # Add to batch instead of direct DB write
+            add_to_db_batch(security_id, timestamp, buy, sell, ltp_val, volume, buy_initiated, sell_initiated, tick_delta)
+            
         except Exception as e:
-            logger.error(f"Marketfeed thread crashed: {e}. Restarting in 5 seconds...")
+            logger.error(f"Error processing quote data for {security_id}: {e}")
             stats['errors'] += 1
-            time.sleep(5)  # Increased restart delay
 
-# Start the market feed in a background thread
-marketfeed_thread_obj = threading.Thread(target=marketfeed_thread, daemon=True)
-marketfeed_thread_obj.start()
+async def async_market_feed_handler():
+    """Async handler for market feed with proper error handling and backoff"""
+    global market_feed_active, reconnect_attempts, stats
+    
+    while market_feed_active:
+        try:
+            if not market_feed:
+                if not init_market_feed():
+                    await asyncio.sleep(RECONNECT_BACKOFF[min(reconnect_attempts, len(RECONNECT_BACKOFF)-1)])
+                    reconnect_attempts += 1
+                    continue
+            
+            logger.info("Starting market feed connection...")
+            stats['connection_status'] = 'connecting'
+            
+            # Start the market feed
+            await market_feed.run_forever()
+            
+            stats['connection_status'] = 'connected'
+            stats['last_successful_connection'] = datetime.now().isoformat()
+            reconnect_attempts = 0  # Reset on successful connection
+            
+            # Process messages
+            while market_feed_active:
+                try:
+                    response = await market_feed.get_data()
+                    if response:
+                        process_market_data(response)
+                    await asyncio.sleep(0.01)  # Small delay to prevent overwhelming
+                except asyncio.CancelledError:
+                    logger.info("Market feed task cancelled")
+                    break
+                except Exception as e:
+                    logger.error(f"Error processing market data: {e}")
+                    stats['errors'] += 1
+                    await asyncio.sleep(1)  # Brief pause on error
+                    
+        except Exception as e:
+            error_msg = str(e).lower()
+            stats['connection_status'] = 'disconnected'
+            stats['errors'] += 1
+            stats['reconnect_attempts'] += 1
+            
+            if "429" in error_msg or "rate limit" in error_msg:
+                # Rate limiting - use exponential backoff
+                backoff_time = RECONNECT_BACKOFF[min(reconnect_attempts, len(RECONNECT_BACKOFF)-1)]
+                logger.warning(f"Rate limited. Waiting {backoff_time}s before reconnecting...")
+                await asyncio.sleep(backoff_time)
+                reconnect_attempts += 1
+                
+                if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS:
+                    logger.error("Max reconnection attempts reached. Stopping market feed.")
+                    market_feed_active = False
+                    break
+                    
+            elif "event loop" in error_msg:
+                logger.error("Event loop conflict detected. This may require code restructuring.")
+                await asyncio.sleep(30)
+                
+            else:
+                logger.error(f"Market feed error: {e}. Reconnecting in 10 seconds...")
+                await asyncio.sleep(10)
+        
+        # Brief pause between connection attempts
+        if market_feed_active:
+            await asyncio.sleep(5)
+
+def start_market_feed_thread():
+    """Start the market feed in a separate thread with async event loop"""
+    global market_feed_active, market_feed_task
+    
+    def run_async_loop():
+        try:
+            # Create new event loop for this thread
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            market_feed_task = loop.create_task(async_market_feed_handler())
+            loop.run_until_complete(market_feed_task)
+            
+        except Exception as e:
+            logger.error(f"Event loop error: {e}")
+        finally:
+            try:
+                loop.close()
+            except:
+                pass
+    
+    market_feed_active = True
+    thread = threading.Thread(target=run_async_loop, daemon=True)
+    thread.start()
+    logger.info("Market feed thread started")
 
 # Periodic batch flush thread
 def batch_flush_thread():
     while True:
-        time.sleep(30)  # Flush every 30 seconds
+        time.sleep(20)  # Flush every 20 seconds
         flush_db_batch()
 
 threading.Thread(target=batch_flush_thread, daemon=True).start()
@@ -352,9 +456,9 @@ def get_delta_data(security_id):
                 delta = buy_delta - sell_delta
                 
                 # Tick-rule aggregation
-                buy_initiated_sum = group['buy_initiated'].sum()
-                sell_initiated_sum = group['sell_initiated'].sum()
-                tick_delta_sum = group['tick_delta'].sum()
+                buy_initiated_sum = group['buy_initiated'].sum() if 'buy_initiated' in group.columns else 0
+                sell_initiated_sum = group['sell_initiated'].sum() if 'sell_initiated' in group.columns else 0
+                tick_delta_sum = group['tick_delta'].sum() if 'tick_delta' in group.columns else 0
                 
                 # Inference
                 threshold = 0
@@ -454,7 +558,6 @@ def get_cumulative_tick_delta(security_id):
         logger.error(f"Error in get_cumulative_tick_delta for {security_id}: {e}")
         return jsonify({"error": "Internal server error"}), 500
 
-
 @app.route('/api/stocks')
 def get_stock_list():
     try:
@@ -471,7 +574,6 @@ def get_live_data(security_id):
     stats['api_calls'] += 1
     data = live_market_data.get(security_id)
     
-    # Removed heavy logging - only log in debug mode or when there's no data
     if not data:
         logger.debug(f"No live data available for security_id: {security_id}")
         return jsonify({"error": "No live data"}), 404
@@ -491,59 +593,93 @@ def get_stats():
     current_stats['uptime_seconds'] = (datetime.now() - datetime.fromisoformat(stats['start_time'])).total_seconds()
     current_stats['db_batch_size'] = len(db_batch)
     current_stats['live_securities'] = len(live_market_data)
+    current_stats['market_feed_active'] = market_feed_active
     return jsonify(current_stats)
 
 @app.route('/api/health')
 def health_check():
     """Health check endpoint for monitoring"""
     return jsonify({
-        "status": "healthy",
+        "status": "healthy" if market_feed_active else "degraded",
         "timestamp": datetime.now().isoformat(),
-        "securities_count": len(live_market_data)
+        "securities_count": len(live_market_data),
+        "connection_status": stats.get('connection_status', 'unknown')
+    })
+
+@app.route('/api/restart_feed')
+def restart_market_feed():
+    """Manual endpoint to restart market feed"""
+    global market_feed_active, reconnect_attempts
+    
+    market_feed_active = False
+    time.sleep(2)  # Allow current operations to finish
+    
+    reconnect_attempts = 0
+    start_market_feed_thread()
+    
+    return jsonify({
+        "status": "restarted",
+        "timestamp": datetime.now().isoformat()
     })
 
 @app.route('/')
 def dashboard():
     return f"""
-    <h1>Order Flow Flask Server Running</h1>
-    <p>Environment: {ENVIRONMENT}</p>
-    <p>Log Level: {LOG_LEVEL}</p>
-    <p>Processed Messages: {stats['messages_processed']}</p>
-    <p>API Calls: {stats['api_calls']}</p>
-    <p>Errors: {stats['errors']}</p>
-    <p>DB Writes: {stats['db_writes']}</p>
-    <p><a href="/api/stats">Stats</a> | <a href="/api/health">Health</a></p>
+    <h1>Order Flow Flask Server</h1>
+    <p><strong>Environment:</strong> {ENVIRONMENT}</p>
+    <p><strong>Log Level:</strong> {LOG_LEVEL}</p>
+    <p><strong>Connection Status:</strong> {stats.get('connection_status', 'unknown')}</p>
+    <p><strong>Market Feed Active:</strong> {market_feed_active}</p>
+    <p><strong>Processed Messages:</strong> {stats['messages_processed']}</p>
+    <p><strong>API Calls:</strong> {stats['api_calls']}</p>
+    <p><strong>Errors:</strong> {stats['errors']}</p>
+    <p><strong>DB Writes:</strong> {stats['db_writes']}</p>
+    <p><strong>Reconnection Attempts:</strong> {stats['reconnect_attempts']}</p>
+    <p><strong>Last Connection:</strong> {stats.get('last_successful_connection', 'Never')}</p>
+    <hr>
+    <p>
+        <a href="/api/stats">Stats</a> | 
+        <a href="/api/health">Health</a> | 
+        <a href="/api/restart_feed">Restart Feed</a>
+    </p>
     """
 
 # Graceful shutdown
 import atexit
 
 def cleanup():
+    global market_feed_active
     logger.info("Shutting down gracefully...")
+    market_feed_active = False
     flush_db_batch()  # Ensure all data is written before shutdown
+    
+    if market_feed_task and not market_feed_task.done():
+        market_feed_task.cancel()
 
+def signal_handler(signum, frame):
+    logger.info(f"Received signal {signum}. Shutting down...")
+    cleanup()
+    sys.exit(0)
+
+# Register signal handlers
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
 atexit.register(cleanup)
 
 if __name__ == '__main__':
     logger.info(f"Starting Flask server in {ENVIRONMENT} mode with log level {LOG_LEVEL}")
-    use_debug = app.config['DEBUG']
-
-    def start_marketfeed_thread():
-        thread = threading.Thread(target=marketfeed_thread, daemon=True)
-        thread.start()
-        logger.info("Marketfeed thread started")
-
-    if use_debug:
-        # Avoid duplicate threads caused by Flask reloader in development
-        try:
-            from werkzeug.serving import is_running_from_reloader
-            if not is_running_from_reloader():
-                start_marketfeed_thread()
-        except ImportError:
-            # Fallback if werkzeug changes
-            start_marketfeed_thread()
-    else:
-        # In production (Render), always safe to start
-        start_marketfeed_thread()
-
-    app.run(debug=use_debug, host='0.0.0.0', port=5000)
+    
+    # Initialize market feed after a short delay to ensure Flask is ready
+    def delayed_start():
+        time.sleep(2)
+        start_market_feed_thread()
+    
+    threading.Thread(target=delayed_start, daemon=True).start()
+    
+    # Run Flask app
+    app.run(
+        debug=app.config['DEBUG'], 
+        host='0.0.0.0', 
+        port=5000,
+        use_reloader=False  # Disable reloader to prevent duplicate threads
+    )
