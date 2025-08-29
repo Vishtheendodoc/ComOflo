@@ -526,4 +526,24 @@ atexit.register(cleanup)
 
 if __name__ == '__main__':
     logger.info(f"Starting Flask server in {ENVIRONMENT} mode with log level {LOG_LEVEL}")
-    app.run(debug=app.config['DEBUG'], host='0.0.0.0', port=5000)
+    use_debug = app.config['DEBUG']
+
+    def start_marketfeed_thread():
+        thread = threading.Thread(target=marketfeed_thread, daemon=True)
+        thread.start()
+        logger.info("Marketfeed thread started")
+
+    if use_debug:
+        # Avoid duplicate threads caused by Flask reloader in development
+        try:
+            from werkzeug.serving import is_running_from_reloader
+            if not is_running_from_reloader():
+                start_marketfeed_thread()
+        except ImportError:
+            # Fallback if werkzeug changes
+            start_marketfeed_thread()
+    else:
+        # In production (Render), always safe to start
+        start_marketfeed_thread()
+
+    app.run(debug=use_debug, host='0.0.0.0', port=5000)
