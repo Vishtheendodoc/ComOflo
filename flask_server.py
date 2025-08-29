@@ -12,40 +12,13 @@ import math
 from dhanhq import DhanContext, MarketFeed
 import sqlite3
 import pandas as pd
-import time
-from collections import deque
 
-# --- ENHANCED CONFIG FOR RATE LIMITING ---
-API_BATCH_SIZE = 3          # Reduced from 5 to 3
-BATCH_INTERVAL_SEC = 10     # Increased from 5 to 10 seconds
-RESET_TIME = "09:15"        
+# --- CONFIG ---
+API_BATCH_SIZE = 1          # Number of stocks per batch API call
+BATCH_INTERVAL_SEC = 5      # Wait time between batches
+RESET_TIME = "09:15"        # Clear delta_history daily at this time
 STOCK_LIST_FILE = "stock_list.csv"
 DB_FILE = "orderflow_data.db"
-
-# Rate limiting configuration
-MAX_REQUESTS_PER_MINUTE = 50  # Adjust based on your API limits
-REQUEST_DELAY = 60 / MAX_REQUESTS_PER_MINUTE  # Delay between requests
-
-# Track request timestamps for rate limiting
-request_timestamps = deque()
-
-def rate_limit_check():
-    """Check if we should delay the request to respect rate limits"""
-    now = time.time()
-    
-    # Remove timestamps older than 1 minute
-    while request_timestamps and now - request_timestamps[0] > 60:
-        request_timestamps.popleft()
-    
-    # If we're at the limit, wait
-    if len(request_timestamps) >= MAX_REQUESTS_PER_MINUTE:
-        sleep_time = 60 - (now - request_timestamps[0]) + 1
-        if sleep_time > 0:
-            logger.info(f"Rate limit reached. Sleeping for {sleep_time:.2f} seconds")
-            time.sleep(sleep_time)
-    
-    # Add current request timestamp
-    request_timestamps.append(now)
 
 # --- LOGGING SETUP ---
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()
@@ -110,16 +83,11 @@ def get_instrument_list():
                 seg = row.get("segment")
                 instr = row.get("instrument")
                 sec_id = str(row["security_id"])
-                
-                # Rate limit check before adding each instrument
-                rate_limit_check()
-                
                 # Map to MarketFeed enums/constants
                 if exch == "NSE" and seg == "D":
                     stocks.append((MarketFeed.NSE_FNO, sec_id, MarketFeed.Quote))
                 elif exch == "MCX" and seg == "M":
-                    stocks.append(("MCX_COMM", sec_id, MarketFeed.Quote))
-                    
+                    stocks.append(("MCX_COMM", sec_id, MarketFeed.Quote))  # Use string for MCX
         logger.info(f"Loaded {len(stocks)} instruments from {STOCK_LIST_FILE}")
     except Exception as e:
         logger.error(f"Failed to load instrument list: {e}")
@@ -194,18 +162,15 @@ def flush_db_batch():
 
 def marketfeed_thread():
     global stats
-    consecutive_errors = 0
-    max_consecutive_errors = 5
-    base_delay = 1  # Base delay in seconds
-    max_delay = 60  # Maximum delay in seconds
     
     while True:
         try:
             market_feed.run_forever()
-            
+            # Continuously fetch and update live_market_data and orderflow_history
             while True:
                 response = market_feed.get_data()
                 
+                # Removed heavy logging - only log in debug mode
                 logger.debug(f"Received market feed response for security: {response.get('security_id') if response else 'None'}")
 
                 if response and isinstance(response, dict):
@@ -223,9 +188,6 @@ def marketfeed_thread():
                         stats['errors'] += 1
                         continue
 
-                    # Reset consecutive errors on successful response
-                    consecutive_errors = 0
-                    
                     # Update stats
                     stats['messages_processed'] += 1
                     
@@ -242,8 +204,8 @@ def marketfeed_thread():
                     orderflow_history[security_id].append(response)
                     
                     # Keep history size manageable
-                    if len(orderflow_history[security_id]) > 10000:
-                        orderflow_history[security_id] = orderflow_history[security_id][-5000:]
+                    if len(orderflow_history[security_id]) > 10000:  # Keep last 10k records
+                        orderflow_history[security_id] = orderflow_history[security_id][-5000:]  # Trim to 5k
                     
                     # Store Quote Data in DB (batched)
                     if response.get('type') == 'Quote Data':
@@ -258,6 +220,7 @@ def marketfeed_thread():
                             ltq = response.get("LTQ", 0)
                             
                             # Tick-rule logic
+                            # 🚀 GoCharting-Style Tick-Rule Logic with Volume De-Duplication
                             prev = prev_ltp[security_id]
                             prev_total_volume = prev_volume.get(security_id, 0)
                             current_total_volume = response.get("volume", 0)
@@ -269,10 +232,13 @@ def marketfeed_thread():
 
                             if prev is not None and delta_volume > 0:
                                 if ltp_val > prev:
+                                    # Price uptick → Buyer aggression
                                     buy_initiated = delta_volume
                                 elif ltp_val < prev:
+                                    # Price downtick → Seller aggression
                                     sell_initiated = delta_volume
                                 else:
+                                    # Price flat → use Bid/Ask proximity
                                     bid_price = response.get("bid_price", 0)
                                     ask_price = response.get("ask_price", 0)
 
@@ -282,46 +248,35 @@ def marketfeed_thread():
                                         elif ltp_val <= bid_price:
                                             sell_initiated = delta_volume
                                         else:
+                                            # Trade between bid/ask → split volume
                                             buy_initiated = delta_volume / 2
                                             sell_initiated = delta_volume / 2
                                     else:
+                                        # No bid/ask → split
                                         buy_initiated = delta_volume / 2
                                         sell_initiated = delta_volume / 2
                             else:
+                                # No new volume → skip
                                 buy_initiated = 0
                                 sell_initiated = 0
 
                             tick_delta = buy_initiated - sell_initiated
                             prev_ltp[security_id] = ltp_val
+
                             
+                            # Add to batch instead of direct DB write
                             add_to_db_batch(security_id, timestamp, buy, sell, ltp_val, volume, buy_initiated, sell_initiated, tick_delta)
                             
                         except Exception as e:
                             logger.error(f"Error processing quote data for {security_id}: {e}")
                             stats['errors'] += 1
                 
-                # Add adaptive delay based on API performance
-                time.sleep(0.05)  # Increased from 0.01 to reduce API pressure
+                time.sleep(0.01)
                 
         except Exception as e:
-            consecutive_errors += 1
+            logger.error(f"Marketfeed thread crashed: {e}. Restarting in 5 seconds...")
             stats['errors'] += 1
-            
-            # Check if it's a 429 rate limit error
-            if "429" in str(e) or "rate limit" in str(e).lower():
-                # Exponential backoff for rate limit errors
-                delay = min(base_delay * (2 ** consecutive_errors), max_delay)
-                logger.warning(f"Rate limit hit (429). Backing off for {delay} seconds. Error: {e}")
-                time.sleep(delay)
-            elif consecutive_errors >= max_consecutive_errors:
-                # For other errors, use longer delay if too many consecutive errors
-                delay = min(base_delay * consecutive_errors, max_delay)
-                logger.error(f"Marketfeed thread crashed: {e}. Too many consecutive errors ({consecutive_errors}). Restarting in {delay} seconds...")
-                time.sleep(delay)
-            else:
-                # Short delay for occasional errors
-                logger.error(f"Marketfeed thread crashed: {e}. Restarting in 5 seconds...")
-                time.sleep(5)
+            time.sleep(5)  # Increased restart delay
 
 # Start the market feed in a background thread
 marketfeed_thread_obj = threading.Thread(target=marketfeed_thread, daemon=True)
@@ -559,18 +514,6 @@ def dashboard():
     <p>DB Writes: {stats['db_writes']}</p>
     <p><a href="/api/stats">Stats</a> | <a href="/api/health">Health</a></p>
     """
-
-# Add a health check for rate limiting in your stats endpoint:
-@app.route('/api/stats')
-def get_stats():
-    """Monitoring endpoint for system health"""
-    current_stats = stats.copy()
-    current_stats['uptime_seconds'] = (datetime.now() - datetime.fromisoformat(stats['start_time'])).total_seconds()
-    current_stats['db_batch_size'] = len(db_batch)
-    current_stats['live_securities'] = len(live_market_data)
-    current_stats['requests_last_minute'] = len(request_timestamps)
-    current_stats['rate_limit_active'] = len(request_timestamps) >= MAX_REQUESTS_PER_MINUTE * 0.8  # 80% threshold
-    return jsonify(current_stats)
 
 # Graceful shutdown
 import atexit
