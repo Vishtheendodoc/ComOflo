@@ -14,8 +14,8 @@ import sqlite3
 import pandas as pd
 
 # --- CONFIG ---
-API_BATCH_SIZE = 5          # Number of stocks per batch API call
-BATCH_INTERVAL_SEC = 5      # Wait time between batches
+API_BATCH_SIZE = 50         # Number of stocks per batch API call
+BATCH_INTERVAL_SEC = 1      # Wait time between batches
 RESET_TIME = "09:15"        # Clear delta_history daily at this time
 STOCK_LIST_FILE = "stock_list.csv"
 DB_FILE = "orderflow_data.db"
