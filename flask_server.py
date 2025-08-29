@@ -508,6 +508,11 @@ def cleanup():
 
 atexit.register(cleanup)
 
+# Start the MarketFeed in a background thread
+marketfeed_thread_obj = threading.Thread(target=marketfeed_thread, daemon=True)
+marketfeed_thread_obj.start()
+
+
 if __name__ == '__main__':
     logger.info(f"Starting Flask server in {ENVIRONMENT} mode with log level {LOG_LEVEL}")
     app.run(debug=app.config['DEBUG'], host='0.0.0.0', port=5000)
