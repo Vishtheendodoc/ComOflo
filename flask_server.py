@@ -69,7 +69,7 @@ db_batch_lock = threading.Lock()
 
 # --- Initialize Dhan API Analyzer ---
 CLIENT_ID = "1100244268"
-ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzU5MDM3OTE2LCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwMDI0NDI2OCJ9.NiJopQOOMl9I3sFI4HUp-d4a-9HKpEXo5EL6jtJheLsjubkzC1saXOx1mjIh-H8_IXCgIXqAjAYydE-sNBnKHg"
+ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzU2Mjk2NDY0LCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwMDI0NDI2OCJ9.OeP6vi2JlsYTNM8QkW-otqCiN0RnWOdddrJ-1rsFUUo7SBGx_emR__zzBi67vjRvQ7I2Pl2GtCaJvkh13h0DOw"
 analyzer = OrderFlowAnalyzer(CLIENT_ID, ACCESS_TOKEN)
 
 # Prepare instrument list from your stock_list.csv
@@ -97,22 +97,8 @@ def get_instrument_list():
 instrument_list = get_instrument_list()
 
 dhan_context = DhanContext(CLIENT_ID, ACCESS_TOKEN)
+market_feed = MarketFeed(dhan_context, [], "v2")
 
-# --- FIXED: Subscribe in chunks to avoid 429 errors ---
-def chunk_list(lst, n):
-    for i in range(0, len(lst), n):
-        yield lst[i:i+n]
-
-market_feed = MarketFeed(dhan_context, [], "v2")  # Start with empty list
-
-for chunk in chunk_list(instrument_list, 25):  # 20–25 instruments per batch
-    try:
-        market_feed.subscribe(chunk)
-        logger.info(f"Subscribed to {len(chunk)} instruments")
-        time.sleep(1)  # Small delay to avoid rate-limiting
-    except Exception as e:
-        logger.error(f"Subscription failed: {e}")
-        time.sleep(2)
 
 def init_db():
     try:
@@ -175,127 +161,110 @@ def flush_db_batch():
             store_in_db_batch(db_batch.copy())
             db_batch.clear()
 
+def subscribe_in_batches(feed, instruments, batch_size=100, delay=1.2):
+    """
+    Subscribe to instruments in safe batches to avoid 429 rate-limit errors.
+    """
+    for i in range(0, len(instruments), batch_size):
+        batch = instruments[i:i + batch_size]
+        try:
+            feed.subscribe(batch)
+            logger.info(f"Subscribed batch {i // batch_size + 1} with {len(batch)} instruments")
+        except Exception as e:
+            logger.error(f"Subscription failed for batch {i // batch_size + 1}: {e}")
+        time.sleep(delay)  # respect 1 request/sec
+        
+
 def marketfeed_thread():
     global stats
-    
+    instruments = get_instrument_list()   # your CSV instrument loader
+
     while True:
         try:
-            market_feed.run_forever()
-            # Continuously fetch and update live_market_data and orderflow_history
+            logger.info("Starting MarketFeed WebSocket...")
+            market_feed.run_forever()  # connect first
+
+            # Subscribe in batches AFTER connection established
+            subscribe_in_batches(market_feed, instruments)
+
+            # Now consume the data
             while True:
                 response = market_feed.get_data()
-                
-                # Removed heavy logging - only log in debug mode
-                logger.debug(f"Received market feed response for security: {response.get('security_id') if response else 'None'}")
+                if not response:
+                    continue
 
-                if response and isinstance(response, dict):
-                    required_keys = ["security_id"]
-                    missing_keys = [key for key in required_keys if key not in response]
-                    
-                    if missing_keys:
-                        logger.error(f"Missing keys {missing_keys} in response")
-                        stats['errors'] += 1
-                        continue
-                    
-                    security_id = str(response.get("security_id"))
-                    if not security_id:
-                        logger.warning("Empty security_id in response")
-                        stats['errors'] += 1
-                        continue
+                # process your response as before...
+                security_id = str(response.get("security_id", ""))
+                if not security_id:
+                    continue
 
-                    # Update stats
-                    stats['messages_processed'] += 1
-                    
-                    # Periodic logging instead of per-message logging
-                    if stats['messages_processed'] % 1000 == 0:
-                        logger.info(f"Processed {stats['messages_processed']} messages, {stats['errors']} errors, {stats['db_writes']} DB writes")
+                stats['messages_processed'] += 1
+                if stats['messages_processed'] % 1000 == 0:
+                    logger.info(f"Processed {stats['messages_processed']} messages, {stats['errors']} errors, {stats['db_writes']} DB writes")
 
-                    # Update live data
-                    live_market_data[security_id] = response
-                    
-                    # Update history
-                    if security_id not in orderflow_history:
-                        orderflow_history[security_id] = []
-                    orderflow_history[security_id].append(response)
-                    
-                    # Keep history size manageable
-                    if len(orderflow_history[security_id]) > 10000:  # Keep last 10k records
-                        orderflow_history[security_id] = orderflow_history[security_id][-5000:]  # Trim to 5k
-                    
-                    # Store Quote Data in DB (batched)
-                    if response.get('type') == 'Quote Data':
-                        try:
-                            ltt = response.get("LTT")
-                            today = datetime.now().strftime('%Y-%m-%d')
-                            timestamp = f"{today} {ltt}" if ltt else datetime.now().isoformat()
-                            buy = response.get("total_buy_quantity", 0)
-                            sell = response.get("total_sell_quantity", 0)
-                            ltp_val = float(response.get("LTP", 0))
-                            volume = response.get("volume", 0)
-                            ltq = response.get("LTQ", 0)
-                            
-                            # Tick-rule logic
-                            # 🚀 GoCharting-Style Tick-Rule Logic with Volume De-Duplication
-                            prev = prev_ltp[security_id]
-                            prev_total_volume = prev_volume.get(security_id, 0)
-                            current_total_volume = response.get("volume", 0)
-                            delta_volume = current_total_volume - prev_total_volume
-                            prev_volume[security_id] = current_total_volume
+                live_market_data[security_id] = response
+                orderflow_history[security_id].append(response)
 
-                            buy_initiated = 0
-                            sell_initiated = 0
+                if len(orderflow_history[security_id]) > 10000:
+                    orderflow_history[security_id] = orderflow_history[security_id][-5000:]
 
-                            if prev is not None and delta_volume > 0:
-                                if ltp_val > prev:
-                                    # Price uptick → Buyer aggression
-                                    buy_initiated = delta_volume
-                                elif ltp_val < prev:
-                                    # Price downtick → Seller aggression
-                                    sell_initiated = delta_volume
-                                else:
-                                    # Price flat → use Bid/Ask proximity
-                                    bid_price = response.get("bid_price", 0)
-                                    ask_price = response.get("ask_price", 0)
+                # your quote data + tick rule logic here
+                if response.get("type") == "Quote Data":
+                    try:
+                        ltt = response.get("LTT")
+                        today = datetime.now().strftime('%Y-%m-%d')
+                        timestamp = f"{today} {ltt}" if ltt else datetime.now().isoformat()
+                        ltp_val = float(response.get("LTP", 0))
+                        volume = response.get("volume", 0)
 
-                                    if bid_price and ask_price:
-                                        if ltp_val >= ask_price:
-                                            buy_initiated = delta_volume
-                                        elif ltp_val <= bid_price:
-                                            sell_initiated = delta_volume
-                                        else:
-                                            # Trade between bid/ask → split volume
-                                            buy_initiated = delta_volume / 2
-                                            sell_initiated = delta_volume / 2
-                                    else:
-                                        # No bid/ask → split
-                                        buy_initiated = delta_volume / 2
-                                        sell_initiated = delta_volume / 2
+                        # Tick Rule
+                        prev = prev_ltp[security_id]
+                        prev_total_volume = prev_volume.get(security_id, 0)
+                        current_total_volume = volume
+                        delta_volume = current_total_volume - prev_total_volume
+                        prev_volume[security_id] = current_total_volume
+
+                        buy_initiated, sell_initiated = 0, 0
+                        if prev is not None and delta_volume > 0:
+                            if ltp_val > prev:
+                                buy_initiated = delta_volume
+                            elif ltp_val < prev:
+                                sell_initiated = delta_volume
                             else:
-                                # No new volume → skip
-                                buy_initiated = 0
-                                sell_initiated = 0
+                                bid_price = response.get("bid_price", 0)
+                                ask_price = response.get("ask_price", 0)
+                                if bid_price and ask_price:
+                                    if ltp_val >= ask_price:
+                                        buy_initiated = delta_volume
+                                    elif ltp_val <= bid_price:
+                                        sell_initiated = delta_volume
+                                    else:
+                                        buy_initiated = sell_initiated = delta_volume / 2
+                                else:
+                                    buy_initiated = sell_initiated = delta_volume / 2
 
-                            tick_delta = buy_initiated - sell_initiated
-                            prev_ltp[security_id] = ltp_val
+                        tick_delta = buy_initiated - sell_initiated
+                        prev_ltp[security_id] = ltp_val
 
-                            
-                            # Add to batch instead of direct DB write
-                            add_to_db_batch(security_id, timestamp, buy, sell, ltp_val, volume, buy_initiated, sell_initiated, tick_delta)
-                            
-                        except Exception as e:
-                            logger.error(f"Error processing quote data for {security_id}: {e}")
-                            stats['errors'] += 1
-                
+                        add_to_db_batch(
+                            security_id, timestamp,
+                            response.get("total_buy_quantity", 0),
+                            response.get("total_sell_quantity", 0),
+                            ltp_val, volume,
+                            buy_initiated, sell_initiated, tick_delta
+                        )
+
+                    except Exception as e:
+                        logger.error(f"Error processing quote data for {security_id}: {e}")
+                        stats['errors'] += 1
+
                 time.sleep(0.01)
-                
-        except Exception as e:
-            logger.error(f"Marketfeed thread crashed: {e}. Restarting in 5 seconds...")
-            stats['errors'] += 1
-            time.sleep(5)  # Increased restart delay
 
-# Start the market feed in a background thread
-marketfeed_thread_obj = threading.Thread(target=marketfeed_thread, daemon=True)
-marketfeed_thread_obj.start()
+        except Exception as e:
+            logger.error(f"Marketfeed thread crashed: {e}. Restarting in 15 seconds...")
+            stats['errors'] += 1
+            time.sleep(15)  # longer backoff
+
 
 # Periodic batch flush thread
 def batch_flush_thread():
