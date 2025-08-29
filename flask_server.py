@@ -97,7 +97,22 @@ def get_instrument_list():
 instrument_list = get_instrument_list()
 
 dhan_context = DhanContext(CLIENT_ID, ACCESS_TOKEN)
-market_feed = MarketFeed(dhan_context, instrument_list, "v2")
+
+# --- FIXED: Subscribe in chunks to avoid 429 errors ---
+def chunk_list(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i+n]
+
+market_feed = MarketFeed(dhan_context, [], "v2")  # Start with empty list
+
+for chunk in chunk_list(instrument_list, 25):  # 20–25 instruments per batch
+    try:
+        market_feed.subscribe(chunk)
+        logger.info(f"Subscribed to {len(chunk)} instruments")
+        time.sleep(1)  # Small delay to avoid rate-limiting
+    except Exception as e:
+        logger.error(f"Subscription failed: {e}")
+        time.sleep(2)
 
 def init_db():
     try:
