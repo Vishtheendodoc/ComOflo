@@ -208,7 +208,9 @@ def marketfeed_thread():
                         orderflow_history[security_id] = orderflow_history[security_id][-5000:]  # Trim to 5k
                     
                     # Store Quote Data in DB (batched)
-                    if response.get('type') == 'Quote Data':
+                    msg_type = response.get("type", "")
+                    if msg_type in ("Quote Data", "Quote"):   # ✅ accept both
+
                         try:
                             ltt = response.get("LTT")
                             today = datetime.now().strftime('%Y-%m-%d')
