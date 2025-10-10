@@ -4,7 +4,7 @@ import threading
 import time
 import os
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from orderflow import OrderFlowAnalyzer, live_market_data, orderflow_history
 import csv
 from collections import defaultdict
@@ -34,6 +34,49 @@ logger = logging.getLogger(__name__)
 # Disable debug logging in production
 if ENVIRONMENT == 'production':
     logging.disable(logging.DEBUG)
+
+def get_ist_now():
+    """Get current time in IST"""
+    ist = timezone(timedelta(hours=5, minutes=30))
+    return datetime.now(ist)
+
+def format_ist_timestamp(ltt=None):
+    """
+    Format timestamp in IST
+    Args:
+        ltt: Last Trade Time string (HH:MM:SS format)
+    Returns:
+        Timestamp string in IST (YYYY-MM-DD HH:MM:SS format)
+    """
+    ist = timezone(timedelta(hours=5, minutes=30))
+    
+    if ltt:
+        try:
+            # Parse the time from LTT
+            time_parts = ltt.split(':')
+            hours = int(time_parts[0])
+            minutes = int(time_parts[1])
+            seconds = int(time_parts[2]) if len(time_parts) > 2 else 0
+            
+            # Get today's date in IST
+            now_ist = datetime.now(ist)
+            
+            # Create datetime with IST timezone
+            timestamp = now_ist.replace(
+                hour=hours, 
+                minute=minutes, 
+                second=seconds, 
+                microsecond=0
+            )
+            
+            return timestamp.strftime('%Y-%m-%d %H:%M:%S')
+        except Exception as e:
+            logger.error(f"Error parsing LTT {ltt}: {e}")
+            # Fallback to current IST time
+            return datetime.now(ist).strftime('%Y-%m-%d %H:%M:%S')
+    else:
+        # No LTT provided, use current IST time
+        return datetime.now(ist).strftime('%Y-%m-%d %H:%M:%S')
 
 # --- FLASK SETUP ---
 app = Flask(__name__)
@@ -293,13 +336,15 @@ def batch_flush_thread():
 threading.Thread(target=batch_flush_thread, daemon=True).start()
 
 def maybe_reset_history():
-    now = datetime.now()
+    """Reset history at RESET_TIME using IST timezone"""
+    ist = timezone(timedelta(hours=5, minutes=30))
+    now = datetime.now(ist)
     today_str = now.strftime('%Y-%m-%d')
 
     if last_reset_date[0] != today_str and now.strftime('%H:%M') >= RESET_TIME:
         delta_history.clear()
         last_reset_date[0] = today_str
-        logger.info(f"Cleared delta history at {now.strftime('%H:%M:%S')}")
+        logger.info(f"Cleared delta history at {now.strftime('%H:%M:%S')} IST")
 
 def load_stock_list():
     stocks = []
