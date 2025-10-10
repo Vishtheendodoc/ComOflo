@@ -10,3 +10,4 @@ python-dotenv
 gunicorn
 psutil
 nest-asyncio
+pytz==2024.1
