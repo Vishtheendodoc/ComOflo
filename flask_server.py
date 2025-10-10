@@ -5,6 +5,7 @@ import time
 import os
 import logging
 from datetime import datetime, timezone, timedelta
+import pytz
 from orderflow import OrderFlowAnalyzer, live_market_data, orderflow_history
 import csv
 from collections import defaultdict
@@ -12,6 +13,7 @@ import math
 from dhanhq import DhanContext, MarketFeed
 import sqlite3
 import pandas as pd
+IST = pytz.timezone('Asia/Kolkata')
 
 # --- CONFIG ---
 API_BATCH_SIZE = 5          # Number of stocks per batch API call
@@ -36,47 +38,62 @@ if ENVIRONMENT == 'production':
     logging.disable(logging.DEBUG)
 
 def get_ist_now():
-    """Get current time in IST"""
-    ist = timezone(timedelta(hours=5, minutes=30))
-    return datetime.now(ist)
+    """
+    Get current time in IST
+    Works correctly on any server timezone (including Render's UTC)
+    """
+    return datetime.now(IST)
 
 def format_ist_timestamp(ltt=None):
     """
-    Format timestamp in IST
+    Format timestamp in IST timezone
+    
     Args:
-        ltt: Last Trade Time string (HH:MM:SS format)
+        ltt: Last Trade Time string (HH:MM:SS format) from market feed
+        
     Returns:
         Timestamp string in IST (YYYY-MM-DD HH:MM:SS format)
+        
+    Note: This works correctly even when server is in UTC (like Render)
     """
-    ist = timezone(timedelta(hours=5, minutes=30))
-    
-    if ltt:
-        try:
-            # Parse the time from LTT
+    try:
+        if ltt:
+            # Parse the time from LTT (format: HH:MM:SS)
             time_parts = ltt.split(':')
             hours = int(time_parts[0])
             minutes = int(time_parts[1])
             seconds = int(time_parts[2]) if len(time_parts) > 2 else 0
             
-            # Get today's date in IST
-            now_ist = datetime.now(ist)
+            # Get current date in IST (not server time!)
+            now_ist = datetime.now(IST)
             
             # Create datetime with IST timezone
-            timestamp = now_ist.replace(
+            timestamp_ist = now_ist.replace(
                 hour=hours, 
                 minute=minutes, 
                 second=seconds, 
                 microsecond=0
             )
             
-            return timestamp.strftime('%Y-%m-%d %H:%M:%S')
-        except Exception as e:
-            logger.error(f"Error parsing LTT {ltt}: {e}")
-            # Fallback to current IST time
-            return datetime.now(ist).strftime('%Y-%m-%d %H:%M:%S')
-    else:
-        # No LTT provided, use current IST time
-        return datetime.now(ist).strftime('%Y-%m-%d %H:%M:%S')
+            # Return formatted string (without timezone info for CSV compatibility)
+            return timestamp_ist.strftime('%Y-%m-%d %H:%M:%S')
+        else:
+            # No LTT provided, use current IST time
+            return datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')
+            
+    except Exception as e:
+        logger.error(f"Error parsing LTT '{ltt}': {e}")
+        # Fallback to current IST time
+        return datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')
+
+def utc_to_ist(utc_dt):
+    """
+    Convert UTC datetime to IST
+    Useful if you receive UTC timestamps from external sources
+    """
+    if utc_dt.tzinfo is None:
+        utc_dt = pytz.utc.localize(utc_dt)
+    return utc_dt.astimezone(IST)
 
 # --- FLASK SETUP ---
 app = Flask(__name__)
@@ -102,7 +119,7 @@ stats = {
     'api_calls': 0,
     'errors': 0,
     'db_writes': 0,
-    'start_time': datetime.now().isoformat()
+    'start_time': get_ist_now().isoformat()  # ✅ IST start time
 }
 
 # Batch processing for database writes
@@ -256,8 +273,8 @@ def marketfeed_thread():
 
                         try:
                             ltt = response.get("LTT")
-                            today = datetime.now().strftime('%Y-%m-%d')
-                            timestamp = f"{today} {ltt}" if ltt else datetime.now().isoformat()
+                            timestamp = format_ist_timestamp(ltt)  # ✅ Always IST
+                            
                             buy = response.get("total_buy_quantity", 0)
                             sell = response.get("total_sell_quantity", 0)
                             ltp_val = float(response.get("LTP", 0))
@@ -336,9 +353,11 @@ def batch_flush_thread():
 threading.Thread(target=batch_flush_thread, daemon=True).start()
 
 def maybe_reset_history():
-    """Reset history at RESET_TIME using IST timezone"""
-    ist = timezone(timedelta(hours=5, minutes=30))
-    now = datetime.now(ist)
+    """
+    Reset history at RESET_TIME using IST timezone
+    Works correctly on Render (UTC servers)
+    """
+    now = get_ist_now()  # ✅ Get IST time, not server time
     today_str = now.strftime('%Y-%m-%d')
 
     if last_reset_date[0] != today_str and now.strftime('%H:%M') >= RESET_TIME:
@@ -535,7 +554,13 @@ def get_orderflow_history(security_id):
 def get_stats():
     """Monitoring endpoint for system health"""
     current_stats = stats.copy()
-    current_stats['uptime_seconds'] = (datetime.now() - datetime.fromisoformat(stats['start_time'])).total_seconds()
+    start_time_ist = pytz.utc.localize(
+        datetime.fromisoformat(stats['start_time'])
+    ).astimezone(IST) if stats['start_time'] else get_ist_now()
+    
+    current_stats['uptime_seconds'] = (get_ist_now() - start_time_ist).total_seconds()
+    current_stats['current_time_ist'] = get_ist_now().strftime('%Y-%m-%d %H:%M:%S')
+    current_stats['timezone'] = 'Asia/Kolkata (IST)'
     current_stats['db_batch_size'] = len(db_batch)
     current_stats['live_securities'] = len(live_market_data)
     return jsonify(current_stats)
@@ -545,7 +570,8 @@ def health_check():
     """Health check endpoint for monitoring"""
     return jsonify({
         "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": get_ist_now().isoformat(),  # ✅ IST timestamp
+        "timezone": "Asia/Kolkata (IST)",
         "securities_count": len(live_market_data)
     })
 
