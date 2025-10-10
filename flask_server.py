@@ -12,6 +12,8 @@ import math
 from dhanhq import DhanContext, MarketFeed
 import sqlite3
 import pandas as pd
+import pytz
+IST = pytz.timezone("Asia/Kolkata")
 
 # --- CONFIG ---
 API_BATCH_SIZE = 5          # Number of stocks per batch API call
@@ -59,7 +61,7 @@ stats = {
     'api_calls': 0,
     'errors': 0,
     'db_writes': 0,
-    'start_time': datetime.now().isoformat()
+    'start_time': datetime.now(IST).isoformat()
 }
 
 # Batch processing for database writes
@@ -213,8 +215,8 @@ def marketfeed_thread():
 
                         try:
                             ltt = response.get("LTT")
-                            today = datetime.now().strftime('%Y-%m-%d')
-                            timestamp = f"{today} {ltt}" if ltt else datetime.now().isoformat()
+                            today = datetime.now(IST).strftime('%Y-%m-%d')
+                            timestamp = f"{today} {ltt}" if ltt else datetime.now(IST).isoformat()
                             buy = response.get("total_buy_quantity", 0)
                             sell = response.get("total_sell_quantity", 0)
                             ltp_val = float(response.get("LTP", 0))
@@ -293,7 +295,7 @@ def batch_flush_thread():
 threading.Thread(target=batch_flush_thread, daemon=True).start()
 
 def maybe_reset_history():
-    now = datetime.now()
+    now = datetime.now(IST)
     today_str = now.strftime('%Y-%m-%d')
 
     if last_reset_date[0] != today_str and now.strftime('%H:%M') >= RESET_TIME:
@@ -436,7 +438,7 @@ def get_cumulative_tick_delta(security_id):
             df = df.dropna(subset=['timestamp'])
 
         # Optional: filter for today only
-        today = datetime.now().date()
+        today = datetime.now(IST).date()
         df = df[df['timestamp'].dt.date == today]
 
         # Optional: resample by interval (if needed)
@@ -490,7 +492,7 @@ def get_orderflow_history(security_id):
 def get_stats():
     """Monitoring endpoint for system health"""
     current_stats = stats.copy()
-    current_stats['uptime_seconds'] = (datetime.now() - datetime.fromisoformat(stats['start_time'])).total_seconds()
+    current_stats['uptime_seconds'] = (datetime.now(IST) - datetime.fromisoformat(stats['start_time'])).total_seconds()
     current_stats['db_batch_size'] = len(db_batch)
     current_stats['live_securities'] = len(live_market_data)
     return jsonify(current_stats)
@@ -500,7 +502,7 @@ def health_check():
     """Health check endpoint for monitoring"""
     return jsonify({
         "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": datetime.now(IST).isoformat(),
         "securities_count": len(live_market_data)
     })
 
