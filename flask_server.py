@@ -71,7 +71,7 @@ db_batch_lock = threading.Lock()
 
 # --- Initialize Dhan API Analyzer ---
 CLIENT_ID = "1100244268"
-ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzY0OTk4NDg4LCJpYXQiOjE3NjQ5MTIwODgsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTAwMjQ0MjY4In0.kIl49mCUT1nQVQofsUbeKX-6oskWWw6-w9gUVjtBYttz4xe6w8r6r2F14GlASMH6CxnC-szfjIHVQuj4OHKuLQ"
+ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzY1MjU2NjE0LCJpYXQiOjE3NjUxNzAyMTQsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTAwMjQ0MjY4In0.HDL-dHpOVuQCe40cFphAW6tNpjRR-voo8WOmahBXlDEqo00l7EHZqM-OA2aTZvUkLYVDR8SQTaLQHoO15aQWDA"
 analyzer = OrderFlowAnalyzer(CLIENT_ID, ACCESS_TOKEN)
 
 # Prepare instrument list from your stock_list.csv
