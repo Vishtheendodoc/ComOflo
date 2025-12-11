@@ -411,7 +411,7 @@ class DhanWebSocketClient:
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     CLIENT_ID = "1100244268"
-    ACCESS_TOKEN = "REPLACE_ME"
+    ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzY1NTE1NDY2LCJpYXQiOjE3NjU0MjkwNjYsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTAwMjQ0MjY4In0.wD3K7JjlDlT28UaHh_hWFtncemKKHIqKekSlfJrDR3h9gDdCTl3vbUADcVfeMqgNwL3JEgOCC9vFXee0CDdkOQ"
 
     analyzer = OrderFlowAnalyzer(CLIENT_ID, ACCESS_TOKEN)
 
