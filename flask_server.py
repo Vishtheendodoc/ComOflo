@@ -210,8 +210,8 @@ def get_hist(security_id):
 # MAIN RUN
 # -------------------------------------------------------------------
 if __name__ == "__main__":
-    ACCESS_TOKEN = "REPLACE"
-    CLIENT_ID = "REPLACE"
+    ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzY1NTE1NDY2LCJpYXQiOjE3NjU0MjkwNjYsInRva2VuQ29uc3VtZXJUeXBlIjoiU0VMRiIsIndlYmhvb2tVcmwiOiIiLCJkaGFuQ2xpZW50SWQiOiIxMTAwMjQ0MjY4In0.wD3K7JjlDlT28UaHh_hWFtncemKKHIqKekSlfJrDR3h9gDdCTl3vbUADcVfeMqgNwL3JEgOCC9vFXee0CDdkOQ"
+    CLIENT_ID = "1100244268"
 
     # Example instrument list → replace with your CSV loader
     instruments = [
