@@ -206,6 +206,11 @@ def get_live(security_id):
 def get_hist(security_id):
     return jsonify(orderflow_history.get(security_id, []))
 
+@app.route("/api/delta_data/<security_id>")
+def get_delta_data(security_id):
+    return jsonify(live_data.get(security_id, {}))
+
+
 # -------------------------------------------------------------------
 # MAIN RUN
 # -------------------------------------------------------------------
