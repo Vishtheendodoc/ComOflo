@@ -79,14 +79,24 @@ jobs:
           security_ids = [str(s['security_id']) for s in stock_list if 'security_id' in s]
           print(f"✅ Found {len(security_ids)} securities")
 
-          # --- Fetch data for each security ---
+          # --- Fetch data for each security (with OI columns) ---
           combined_df = pd.DataFrame()
           skipped = []
+          
+          # Track OI data availability
+          oi_columns_found = False
+          
           for sid in security_ids:
               data = fetch_json(f"{api_data}{sid}?interval=1")
               if data:
                   df = pd.DataFrame(data)
                   df['security_id'] = sid
+                  
+                  # Check if OI columns exist in the data
+                  if not oi_columns_found and any(col in df.columns for col in ['open_interest', 'oi_change', 'oi_interpretation']):
+                      oi_columns_found = True
+                      print("✅ OI columns detected in data")
+                  
                   combined_df = pd.concat([combined_df, df], ignore_index=True)
               else:
                   print(f"⚠️ Skipped {sid} due to errors")
@@ -96,11 +106,53 @@ jobs:
               print("⚠️ No data fetched for any security. Skipping upload.")
               exit(0)
 
+          # --- Ensure consistent column order (with OI columns) ---
+          # Base columns (always present)
+          base_columns = [
+              'security_id',
+              'timestamp',
+              'buy_volume',
+              'sell_volume',
+              'buy_initiated',
+              'sell_initiated',
+              'tick_delta',
+              'open',
+              'high',
+              'low',
+              'close',
+              'delta',
+              'inference'
+          ]
+          
+          # OI columns (if present)
+          oi_columns = ['open_interest', 'oi_change', 'oi_interpretation']
+          
+          # Build final column list based on what's available
+          final_columns = []
+          for col in base_columns:
+              if col in combined_df.columns:
+                  final_columns.append(col)
+          
+          # Add OI columns if they exist
+          for col in oi_columns:
+              if col in combined_df.columns:
+                  final_columns.append(col)
+          
+          # Reorder dataframe
+          combined_df = combined_df[final_columns]
+          
+          # Log column summary
+          print(f"📊 Columns in backup: {', '.join(final_columns)}")
+          if oi_columns_found:
+              print("✅ Backup includes OI data")
+          else:
+              print("ℹ️ Backup does not include OI data (legacy format)")
+
           # --- Save CSV atomically ---
           temp_filename = f"{filename}.tmp"
           combined_df.to_csv(temp_filename, index=False)
           os.replace(temp_filename, filename)
-          print(f"✅ Saved snapshot atomically: {filename}")
+          print(f"✅ Saved snapshot atomically: {filename} ({len(combined_df)} rows)")
 
           # --- Upload with retry ---
           g = Github(token)
@@ -132,13 +184,19 @@ jobs:
                           print(f"❌ Giving up after {max_retries} attempts.")
                           return False
 
-          success = upload_file_with_retry(repo, remote_path, filename, f"Backup {filename}")
+          # Create commit message with metadata
+          commit_msg = f"Backup {filename}"
+          if oi_columns_found:
+              commit_msg += " [with OI data]"
+          
+          success = upload_file_with_retry(repo, remote_path, filename, commit_msg)
           if not success:
               print(f"❌ Backup upload failed for {filename}")
-              # Optional notification can be added here
               exit(1)
 
           print(f"🎉 Backup completed successfully: {filename}")
+          print(f"📈 Total rows: {len(combined_df)}")
+          print(f"📊 Total securities: {len(security_ids) - len(skipped)}")
           if skipped:
-              print(f"⚠️ Skipped securities: {skipped}")
+              print(f"⚠️ Skipped securities ({len(skipped)}): {skipped[:10]}{'...' if len(skipped) > 10 else ''}")
           EOF
