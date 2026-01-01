@@ -4,7 +4,8 @@ import threading
 import time
 import os
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, time as dt_time
+from functools import lru_cache
 from orderflow import OrderFlowAnalyzer, live_market_data, orderflow_history
 import csv
 from collections import defaultdict
@@ -320,16 +321,29 @@ def load_stock_list():
 def get_delta_data(security_id):
     try:
         interval = int(request.args.get('interval', 5))
+        # Optional: limit to last N hours (default: today only, max 24 hours)
+        hours_back = int(request.args.get('hours', 24))
     except (ValueError, TypeError):
         interval = 5
+        hours_back = 24
     
     try:
-        # Query from SQLite DB
+        # Calculate time filter (only fetch recent data)
+        now = datetime.now(IST)
+        start_time = now - timedelta(hours=hours_back)
+        start_time_str = start_time.strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Query from SQLite DB with date filter and only needed columns
         with sqlite3.connect(DB_FILE) as conn:
-            df = pd.read_sql_query(
-                "SELECT * FROM orderflow WHERE security_id = ? ORDER BY timestamp ASC",
-                conn, params=(security_id,)
-            )
+            # Only select columns we need, filter by date
+            query = """
+                SELECT timestamp, buy_volume, sell_volume, ltp, 
+                       buy_initiated, sell_initiated, tick_delta
+                FROM orderflow 
+                WHERE security_id = ? AND timestamp >= ?
+                ORDER BY timestamp ASC
+            """
+            df = pd.read_sql_query(query, conn, params=(security_id, start_time_str))
         
         if df.empty:
             return jsonify([])
@@ -343,7 +357,15 @@ def get_delta_data(security_id):
                 logger.error(f"Timestamp parsing failed for security {security_id}")
                 return jsonify([])
 
-        df['minute'] = df['timestamp'].dt.strftime('%H:%M')
+        # Filter to today's data (9 AM to 11:59 PM)
+        today = now.date()
+        start_of_day = datetime.combine(today, dt_time(9, 0))
+        end_of_day = datetime.combine(today, dt_time(23, 59, 59))
+        df = df[(df['timestamp'] >= start_of_day) & (df['timestamp'] <= end_of_day)]
+        
+        if df.empty:
+            return jsonify([])
+        
         buckets = []
         grouped = df.groupby(pd.Grouper(key='timestamp', freq=f'{interval}min'))
         
@@ -418,15 +440,86 @@ def get_delta_data(security_id):
         stats['errors'] += 1
         return jsonify({"error": "Internal server error"}), 500
 
+@app.route('/api/historical_data/<string:security_id>')
+def get_historical_data(security_id):
+    """
+    Fetch all historical data for a security from SQLite.
+    This replaces the need for GitHub snapshots.
+    
+    Query params:
+    - days: Number of days to fetch (default: 7, max: 30)
+    - start_date: Start date in YYYY-MM-DD format (optional)
+    - end_date: End date in YYYY-MM-DD format (optional)
+    """
+    try:
+        # Get query parameters
+        days = int(request.args.get('days', 7))
+        days = min(days, 30)  # Limit to 30 days max for performance
+        start_date = request.args.get('start_date')
+        end_date = request.args.get('end_date')
+        
+        now = datetime.now(IST)
+        
+        # Build date filter
+        if start_date and end_date:
+            # Use provided date range
+            start_time_str = f"{start_date} 00:00:00"
+            end_time_str = f"{end_date} 23:59:59"
+        else:
+            # Use days parameter
+            start_time = now - timedelta(days=days)
+            start_time_str = start_time.strftime('%Y-%m-%d %H:%M:%S')
+            end_time_str = now.strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Query from SQLite DB - fetch all columns needed for dashboard
+        with sqlite3.connect(DB_FILE) as conn:
+            query = """
+                SELECT timestamp, buy_volume, sell_volume, ltp, volume,
+                       buy_initiated, sell_initiated, tick_delta
+                FROM orderflow 
+                WHERE security_id = ? AND timestamp >= ? AND timestamp <= ?
+                ORDER BY timestamp ASC
+            """
+            df = pd.read_sql_query(query, conn, params=(security_id, start_time_str, end_time_str))
+        
+        if df.empty:
+            return jsonify([])
+        
+        # Convert timestamp to datetime
+        if not pd.api.types.is_datetime64_any_dtype(df['timestamp']):
+            df['timestamp'] = pd.to_datetime(df['timestamp'], format='%Y-%m-%d %H:%M:%S', errors='coerce')
+            df = df.dropna(subset=['timestamp'])
+        
+        # Convert to list of dicts for JSON response
+        result = df.to_dict('records')
+        
+        # Convert datetime to string for JSON serialization
+        for record in result:
+            if pd.notna(record['timestamp']):
+                record['timestamp'] = record['timestamp'].isoformat()
+        
+        stats['api_calls'] += 1
+        return jsonify(result)
+    
+    except Exception as e:
+        logger.error(f"Error in get_historical_data for {security_id}: {e}")
+        stats['errors'] += 1
+        return jsonify({"error": "Internal server error"}), 500
+
 @app.route('/api/cumulative_delta/<string:security_id>')
 def get_cumulative_tick_delta(security_id):
     try:
         interval = int(request.args.get('interval', 5))
 
+        # Filter to today's data only for better performance
+        today = datetime.now(IST).date()
+        start_time_str = today.strftime('%Y-%m-%d 09:00:00')
+        end_time_str = today.strftime('%Y-%m-%d 23:59:59')
+
         with sqlite3.connect(DB_FILE) as conn:
             df = pd.read_sql_query(
-                "SELECT timestamp, tick_delta FROM orderflow WHERE security_id = ? ORDER BY timestamp ASC",
-                conn, params=(security_id,)
+                "SELECT timestamp, tick_delta FROM orderflow WHERE security_id = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp ASC",
+                conn, params=(security_id, start_time_str, end_time_str)
             )
 
         if df.empty or 'tick_delta' not in df.columns:
@@ -436,10 +529,6 @@ def get_cumulative_tick_delta(security_id):
         if not pd.api.types.is_datetime64_any_dtype(df['timestamp']):
             df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
             df = df.dropna(subset=['timestamp'])
-
-        # Optional: filter for today only
-        today = datetime.now(IST).date()
-        df = df[df['timestamp'].dt.date == today]
 
         # Optional: resample by interval (if needed)
         grouped = df.groupby(pd.Grouper(key='timestamp', freq=f'{interval}min'))
