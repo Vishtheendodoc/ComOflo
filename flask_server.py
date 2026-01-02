@@ -1,6 +1,5 @@
 from flask import Flask, render_template, jsonify, request, g
 from flask_cors import CORS
-from flask_compress import Compress
 import threading
 import time
 import os
@@ -20,6 +19,25 @@ import pytz
 import json
 import hashlib
 IST = pytz.timezone("Asia/Kolkata")
+
+# --- LOGGING SETUP (must be early) ---
+LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()
+ENVIRONMENT = os.getenv('ENVIRONMENT', 'development')
+
+# Configure logging
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Try to import flask-compress (optional)
+try:
+    from flask_compress import Compress
+    COMPRESS_AVAILABLE = True
+except ImportError:
+    COMPRESS_AVAILABLE = False
+    logger.warning("flask-compress not available, compression disabled")
 
 # --- CONFIG ---
 API_BATCH_SIZE = 5          # Number of stocks per batch API call
@@ -44,17 +62,6 @@ CACHE_TTL = 300  # 5 minutes cache TTL
 query_cache = {}  # Simple in-memory cache
 cache_lock = threading.Lock()
 
-# --- LOGGING SETUP ---
-LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()
-ENVIRONMENT = os.getenv('ENVIRONMENT', 'development')
-
-# Configure logging
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
 # Disable debug logging in production
 if ENVIRONMENT == 'production':
     logging.disable(logging.DEBUG)
@@ -63,14 +70,18 @@ if ENVIRONMENT == 'production':
 app = Flask(__name__)
 CORS(app)
 
-# Enable gzip compression (like GoCharting)
-Compress(app)
+# Enable gzip compression (like GoCharting) - optional
+if COMPRESS_AVAILABLE:
+    Compress(app)
+    app.config['COMPRESS_MIMETYPES'] = ['text/html', 'text/css', 'application/json', 'application/javascript']
+    app.config['COMPRESS_LEVEL'] = 6
+    app.config['COMPRESS_MIN_SIZE'] = 500
+    logger.info("✅ Response compression enabled")
+else:
+    logger.warning("⚠️ Response compression disabled (flask-compress not installed)")
 
 # Set Flask debug mode based on environment
 app.config['DEBUG'] = ENVIRONMENT != 'production'
-app.config['COMPRESS_MIMETYPES'] = ['text/html', 'text/css', 'application/json', 'application/javascript']
-app.config['COMPRESS_LEVEL'] = 6
-app.config['COMPRESS_MIN_SIZE'] = 500
 
 # Global variables
 analyzer = None
