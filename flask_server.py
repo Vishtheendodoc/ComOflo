@@ -230,15 +230,17 @@ def backup_database():
             logger.error(f"❌ Backup file is empty or missing: {backup_file}")
             return None
         
-        # Keep only last 7 days of backups
+        # Keep only last 3 days of backups (reduced from 7 to save disk space)
+        # Can be overridden via environment variable BACKUP_RETENTION_DAYS
+        retention_days = int(os.getenv('BACKUP_RETENTION_DAYS', 3))
         try:
             for file in os.listdir(BACKUP_DIR):
                 file_path = os.path.join(BACKUP_DIR, file)
                 if os.path.isfile(file_path) and file.endswith('.db'):
                     file_time = datetime.fromtimestamp(os.path.getmtime(file_path))
-                    if (datetime.now() - file_time).days > 7:
+                    if (datetime.now() - file_time).days > retention_days:
                         os.remove(file_path)
-                        logger.info(f"Removed old backup: {file}")
+                        logger.info(f"Removed old backup: {file} (age: {(datetime.now() - file_time).days} days, retention: {retention_days} days)")
         except Exception as e:
             logger.warning(f"Backup cleanup failed: {e}")
         
@@ -250,13 +252,21 @@ def backup_database():
 # Schedule automatic backups every hour
 def backup_scheduler():
     """Run backups periodically with data safety checks"""
-    # Create initial backup on startup
-    time.sleep(60)  # Wait 1 minute for app to stabilize
-    backup_database()
+    # Create initial backup on startup (after 2 minutes to ensure data exists)
+    time.sleep(120)  # Wait 2 minutes for app to stabilize and collect some data
+    logger.info("🔄 Starting backup scheduler...")
+    initial_backup = backup_database()
+    if initial_backup:
+        logger.info(f"✅ Initial backup created: {initial_backup}")
+    else:
+        logger.warning("⚠️ Initial backup failed or skipped (database may be empty)")
     
     while True:
         time.sleep(3600)  # Every hour
-        backup_database()
+        logger.info("🔄 Running scheduled backup...")
+        backup_result = backup_database()
+        if backup_result:
+            logger.info(f"✅ Scheduled backup created: {backup_result}")
         # Also flush database to ensure data persistence
         flush_db_batch()
 
@@ -791,6 +801,14 @@ def health_check():
     except Exception as e:
         logger.error(f"Database health check failed: {e}")
     
+    # Count backup files safely
+    backups_count = 0
+    try:
+        if os.path.exists(BACKUP_DIR):
+            backups_count = len([f for f in os.listdir(BACKUP_DIR) if f.endswith('.db') and 'backup' in f.lower()])
+    except Exception as e:
+        logger.warning(f"Failed to count backups: {e}")
+    
     return jsonify({
         "status": "healthy",
         "timestamp": datetime.now(IST).isoformat(),
@@ -798,10 +816,12 @@ def health_check():
         "database": {
             "healthy": db_healthy,
             "size_mb": round(db_size, 2),
-            "location": DB_FILE
+            "location": DB_FILE,
+            "backup_dir": BACKUP_DIR
         },
         "cache_size": len(query_cache),
-        "backups_count": len([f for f in os.listdir(BACKUP_DIR) if f.endswith('.db')]) if os.path.exists(BACKUP_DIR) else 0
+        "backups_count": backups_count,
+        "backup_status": "active" if backups_count > 0 or (datetime.now(IST) - datetime.fromisoformat(stats['start_time'])).total_seconds() < 180 else "pending"
     })
 
 @app.route('/api/cache/clear')
@@ -831,6 +851,265 @@ def trigger_backup():
         return jsonify({
             "status": "error",
             "message": "Backup failed"
+        }), 500
+
+@app.route('/api/disk/usage')
+def get_disk_usage():
+    """Get disk usage statistics"""
+    try:
+        import shutil
+        
+        # Get disk usage for persistent directory
+        if os.path.exists(PERSISTENT_DIR):
+            total, used, free = shutil.disk_usage(PERSISTENT_DIR)
+        else:
+            # Fallback to current directory
+            total, used, free = shutil.disk_usage(os.path.dirname(os.path.abspath(__file__)))
+        
+        # Database size
+        db_size = 0
+        if os.path.exists(DB_FILE):
+            db_size = os.path.getsize(DB_FILE)
+        
+        # WAL file size (if exists)
+        wal_size = 0
+        wal_file = DB_FILE + '-wal'
+        if os.path.exists(wal_file):
+            wal_size = os.path.getsize(wal_file)
+        
+        # Backup directory size
+        backup_size = 0
+        backup_count = 0
+        if os.path.exists(BACKUP_DIR):
+            for file in os.listdir(BACKUP_DIR):
+                file_path = os.path.join(BACKUP_DIR, file)
+                if os.path.isfile(file_path):
+                    backup_size += os.path.getsize(file_path)
+                    backup_count += 1
+        
+        # Count database records
+        record_count = 0
+        try:
+            with sqlite3.connect(DB_FILE, check_same_thread=False) as conn:
+                cursor = conn.execute("SELECT COUNT(*) FROM orderflow")
+                record_count = cursor.fetchone()[0]
+        except Exception as e:
+            logger.warning(f"Failed to count records: {e}")
+        
+        return jsonify({
+            "status": "success",
+            "disk": {
+                "total_gb": round(total / (1024**3), 2),
+                "used_gb": round(used / (1024**3), 2),
+                "free_gb": round(free / (1024**3), 2),
+                "used_percent": round((used / total) * 100, 2)
+            },
+            "database": {
+                "size_mb": round(db_size / (1024**2), 2),
+                "wal_size_mb": round(wal_size / (1024**2), 2),
+                "record_count": record_count,
+                "location": DB_FILE
+            },
+            "backups": {
+                "count": backup_count,
+                "total_size_mb": round(backup_size / (1024**2), 2),
+                "location": BACKUP_DIR
+            },
+            "persistent_dir": PERSISTENT_DIR
+        })
+    except Exception as e:
+        logger.error(f"Failed to get disk usage: {e}")
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
+
+@app.route('/api/disk/cleanup/backups')
+def cleanup_backups():
+    """Clean old backup files (keep only last N days)"""
+    try:
+        days_to_keep = int(request.args.get('days', 3))  # Default: keep only 3 days
+        days_to_keep = max(1, min(days_to_keep, 30))  # Between 1 and 30 days
+        
+        if not os.path.exists(BACKUP_DIR):
+            return jsonify({
+                "status": "success",
+                "message": "No backup directory found",
+                "deleted_count": 0
+            })
+        
+        deleted_count = 0
+        deleted_size = 0
+        kept_count = 0
+        
+        for file in os.listdir(BACKUP_DIR):
+            file_path = os.path.join(BACKUP_DIR, file)
+            if os.path.isfile(file_path) and file.endswith('.db') and 'backup' in file.lower():
+                file_time = datetime.fromtimestamp(os.path.getmtime(file_path))
+                age_days = (datetime.now() - file_time).days
+                
+                if age_days > days_to_keep:
+                    file_size = os.path.getsize(file_path)
+                    os.remove(file_path)
+                    deleted_count += 1
+                    deleted_size += file_size
+                    logger.info(f"Deleted old backup: {file} (age: {age_days} days)")
+                else:
+                    kept_count += 1
+        
+        return jsonify({
+            "status": "success",
+            "deleted_count": deleted_count,
+            "deleted_size_mb": round(deleted_size / (1024**2), 2),
+            "kept_count": kept_count,
+            "days_kept": days_to_keep,
+            "message": f"Cleaned up {deleted_count} old backup(s), kept {kept_count} backup(s)"
+        })
+    except Exception as e:
+        logger.error(f"Backup cleanup failed: {e}")
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
+
+@app.route('/api/disk/cleanup/database')
+def cleanup_database():
+    """Clean old database records (keep only last N days)"""
+    try:
+        days_to_keep = int(request.args.get('days', 7))  # Default: keep 7 days
+        days_to_keep = max(1, min(days_to_keep, 90))  # Between 1 and 90 days
+        
+        cutoff_date = datetime.now(IST) - timedelta(days=days_to_keep)
+        cutoff_str = cutoff_date.strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Get count before deletion
+        with sqlite3.connect(DB_FILE, check_same_thread=False) as conn:
+            cursor = conn.execute("SELECT COUNT(*) FROM orderflow WHERE timestamp < ?", (cutoff_str,))
+            records_to_delete = cursor.fetchone()[0]
+            
+            # Delete old records
+            conn.execute("DELETE FROM orderflow WHERE timestamp < ?", (cutoff_str,))
+            conn.commit()
+            
+            # Vacuum to reclaim space
+            conn.execute("VACUUM")
+            conn.commit()
+            
+            # Get new count
+            cursor = conn.execute("SELECT COUNT(*) FROM orderflow")
+            remaining_records = cursor.fetchone()[0]
+        
+        logger.info(f"Cleaned up {records_to_delete} old database records, kept {remaining_records} records")
+        
+        return jsonify({
+            "status": "success",
+            "deleted_records": records_to_delete,
+            "remaining_records": remaining_records,
+            "days_kept": days_to_keep,
+            "cutoff_date": cutoff_str,
+            "message": f"Deleted {records_to_delete} old records, kept last {days_to_keep} days"
+        })
+    except Exception as e:
+        logger.error(f"Database cleanup failed: {e}")
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
+
+@app.route('/api/disk/vacuum')
+def vacuum_database():
+    """Vacuum database to reclaim disk space"""
+    try:
+        # Get size before vacuum
+        size_before = 0
+        if os.path.exists(DB_FILE):
+            size_before = os.path.getsize(DB_FILE)
+        
+        # Vacuum database
+        with sqlite3.connect(DB_FILE, check_same_thread=False) as conn:
+            # Checkpoint WAL first
+            conn.execute('PRAGMA wal_checkpoint(FULL)')
+            conn.commit()
+            
+            # Vacuum to reclaim space
+            conn.execute('VACUUM')
+            conn.commit()
+        
+        # Get size after vacuum
+        size_after = 0
+        if os.path.exists(DB_FILE):
+            size_after = os.path.getsize(DB_FILE)
+        
+        space_reclaimed = size_before - size_after
+        
+        logger.info(f"Database vacuumed: reclaimed {space_reclaimed / (1024**2):.2f} MB")
+        
+        return jsonify({
+            "status": "success",
+            "size_before_mb": round(size_before / (1024**2), 2),
+            "size_after_mb": round(size_after / (1024**2), 2),
+            "space_reclaimed_mb": round(space_reclaimed / (1024**2), 2),
+            "message": f"Database vacuumed successfully, reclaimed {round(space_reclaimed / (1024**2), 2)} MB"
+        })
+    except Exception as e:
+        logger.error(f"Database vacuum failed: {e}")
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
+
+@app.route('/api/disk/cleanup')
+def full_cleanup():
+    """Perform full disk cleanup (backups + database + vacuum)"""
+    try:
+        backup_days = int(request.args.get('backup_days', 3))  # Keep 3 days of backups
+        db_days = int(request.args.get('db_days', 7))  # Keep 7 days of database records
+        
+        results = {
+            "backups": {},
+            "database": {},
+            "vacuum": {}
+        }
+        
+        # Clean backups
+        try:
+            backup_response = cleanup_backups()
+            if backup_response.status_code == 200:
+                results["backups"] = backup_response.get_json()
+        except Exception as e:
+            results["backups"] = {"status": "error", "message": str(e)}
+        
+        # Clean database
+        try:
+            db_response = cleanup_database()
+            if db_response.status_code == 200:
+                results["database"] = db_response.get_json()
+        except Exception as e:
+            results["database"] = {"status": "error", "message": str(e)}
+        
+        # Vacuum database
+        try:
+            vacuum_response = vacuum_database()
+            if vacuum_response.status_code == 200:
+                results["vacuum"] = vacuum_response.get_json()
+        except Exception as e:
+            results["vacuum"] = {"status": "error", "message": str(e)}
+        
+        # Get final disk usage
+        usage_response = get_disk_usage()
+        final_usage = usage_response.get_json() if usage_response.status_code == 200 else {}
+        
+        return jsonify({
+            "status": "success",
+            "cleanup_results": results,
+            "final_disk_usage": final_usage,
+            "message": "Full cleanup completed"
+        })
+    except Exception as e:
+        logger.error(f"Full cleanup failed: {e}")
+        return jsonify({
+            "status": "error",
+            "message": str(e)
         }), 500
 
 @app.route('/')
