@@ -2,7 +2,7 @@ name: Daily data_snapshots Cleanup
 
 on:
   schedule:
-    - cron: '0 30 1 * * *'  # Runs daily at 07:00 IST (01:30 UTC)
+    - cron: '30 1 * * *'  # Runs daily at 07:00 IST (01:30 UTC)
   workflow_dispatch:       # Allow manual trigger from GitHub UI
 
 permissions:
